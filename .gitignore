@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Pattern files — these can be gigabytes; never commit
+*.up1
+*.up2
+*.ang
+*.h5
+*.hdf5
+
+# Temp / intermediate files this app writes
+_temp_masked.up1
+_gpu_nlpar_result.up1
+
+# Logs
+*.log
