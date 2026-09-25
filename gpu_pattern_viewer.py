@@ -16,6 +16,14 @@ from scipy.ndimage import gaussian_filter
 from skimage.exposure import equalize_adapthist
 import time
 
+# Console prints use σ/λ/—; when stdout is a pipe/file on Windows it defaults to
+# cp1252 and a bare print would raise UnicodeEncodeError mid-run. Degrade to '?'.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors='replace')
+    except Exception:
+        pass
+
 # GPU acceleration via CuPy (falls back to CPU if unavailable)
 try:
     import cupy as cp
@@ -27,6 +35,14 @@ try:
 except Exception:
     HAS_GPU = False
     print("[GPU] CuPy not available — running CPU-only mode")
+
+# psutil lets chunk sizes track ACTUAL free host RAM instead of a hardcoded row count.
+# Optional: without it we fall back to a conservative fixed budget.
+try:
+    import psutil
+    HAS_PSUTIL = True
+except Exception:
+    HAS_PSUTIL = False
 
 
 class ScanMapCanvas(FigureCanvas):
@@ -89,11 +105,22 @@ class PatternCanvas(FigureCanvas):
         self.ax.set_title(title); self.ax.axis('off')
         super().__init__(self.fig)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-    def show_pattern(self, pat, title="", fixed_range=False):
+    def show_pattern(self, pat, title="", fixed_range=False, vmin=None, vmax=None):
+        """Display a pattern. Priority:
+          1. explicit vmin/vmax → use those (e.g. raw uint8: vmin=0, vmax=255)
+          2. fixed_range=True   → [0,1]   (for already-normalized data)
+          3. neither            → matplotlib auto-stretch (per-pattern min→max)
+        Auto-stretch hides absolute intensity differences across patterns; pass
+        explicit vmin/vmax whenever you want to see true relative brightness.
+        """
         self.ax.clear()
         if pat is not None:
-            if fixed_range: self.ax.imshow(pat, cmap='gray', vmin=0, vmax=1)
-            else: self.ax.imshow(pat, cmap='gray')
+            if vmin is not None or vmax is not None:
+                self.ax.imshow(pat, cmap='gray', vmin=vmin, vmax=vmax)
+            elif fixed_range:
+                self.ax.imshow(pat, cmap='gray', vmin=0, vmax=1)
+            else:
+                self.ax.imshow(pat, cmap='gray')
         self.ax.set_title(title); self.ax.axis('off'); self.draw_idle()
 
 
@@ -110,7 +137,16 @@ class MainWindow(QMainWindow):
         # _sigma_aperture_key stores a tuple identifying which aperture the cached map was built for.
         self.sigma_sq_map = None
         self._sigma_aperture_key = None
+        # Resolved aperture cache (see _current_aperture); keyed by mode/threshold/shape.
+        self._aperture_cache = None
+        self._aperture_cache_key = None
         self._temp_files = []
+        # Global-stretch bounds (dataset-wide percentile, active pixels only).
+        # Computed lazily, cached; invalidated on file load. Same (lo,hi) applied
+        # to every pattern → preserves relative intensity ordering (IQ-safe).
+        self.global_lo = None
+        self.global_hi = None
+        self._global_range_key = None
         self._build_ui()
 
     def closeEvent(self, event):
@@ -170,6 +206,168 @@ class MainWindow(QMainWindow):
             m = m_u8.astype(np.float32)
             return m, float(m.sum()), "AUTO-DETECT"
         return None, float(ph * pw), "NONE"
+
+    def _on_aperture_changed(self):
+        """Aperture is a global gate: it changes N_p (NLPAR), the σ² estimate, the
+        global-stretch percentile population, and which pixels survive to the output.
+        Every cache that depends on it must be dropped and the preview refreshed."""
+        self._invalidate_sigma_map()
+        self._invalidate_global_range()
+        if self.f_orig is not None:
+            self.update_display()
+
+    def _current_aperture(self):
+        """Resolved aperture as a (ph, pw) float32 array of 1.0/0.0, or None when the
+        mode is 'None' (or auto-detect has no pixel_std yet). Cached per (mode, threshold,
+        shape) so the per-chunk save loop isn't rebuilding it on every iteration."""
+        if self.f_orig is None: return None
+        ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
+        key = (self.aperture_mode.currentText(), self.aperture_thresh_spin.value(), ph, pw)
+        if getattr(self, '_aperture_cache_key', None) != key:
+            m, _, _ = self._resolve_aperture_mask(ph, pw)
+            self._aperture_cache = m
+            self._aperture_cache_key = key
+        return self._aperture_cache
+
+    def _host_chunk_rows(self, bytes_per_pixel_live, budget=None, n_rows_total=None):
+        """Rows per chunk that keep host RAM for one chunk inside `budget` bytes.
+
+        `bytes_per_pixel_live` is the SUM of bytes/pixel over every copy of the chunk that
+        is alive at the same time (e.g. uint8 read + float32 cast + a float32 temporary = 9).
+        Hardcoded row counts blew up on large scans: 430 cols x 479x479 px is ~99 MB/row as
+        uint8 but ~790 MB/row as float64, so 50 rows of float64 is ~40 GB. Default budget is
+        the smaller of 3 GB and a quarter of the currently AVAILABLE RAM, so a busy machine
+        chunks smaller instead of swapping (or dying with _ArrayMemoryError)."""
+        if budget is None:
+            if HAS_PSUTIL:
+                budget = min(3.0e9, 0.25 * psutil.virtual_memory().available)
+            else:
+                budget = 1.5e9  # no psutil → conservative fixed budget
+        ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
+        bytes_per_row = self.ncols * ph * pw * float(bytes_per_pixel_live)
+        n_total = n_rows_total if n_rows_total is not None else self.nrows
+        return max(1, min(int(n_total), int(budget // max(bytes_per_row, 1))))
+
+    def _invalidate_global_range(self):
+        """Discard cached global-stretch bounds. Call on file load or when the
+        background configuration changes (subtract/divide/off, or recomputed mean)."""
+        self.global_lo = None
+        self.global_hi = None
+        self._global_range_key = None
+
+    def _bg_config_key(self):
+        """Identifier for the STATIC background config; global-range cache invalidates
+        when this changes so (lo,hi) is always computed in the same domain it's applied in.
+        Global stretch is intentionally coupled to STATIC background only — dynamic
+        background is excluded so dragging its sigma never triggers a dataset rescan."""
+        static_on = self.static_bg_chk.isChecked() and self.mean_pattern is not None
+        mode = self.bg_mode.currentText() if static_on else None
+        # Mean pattern identity matters (recompute-from-IQ changes it); use a cheap hash.
+        mean_id = float(np.sum(self.mean_pattern)) if static_on else None
+        return (static_on, mode, mean_id)
+
+    def _apply_static_background(self, chunk, mean_dtype=None):
+        """Apply ONLY the current STATIC background to a chunk in-memory (no file).
+        Used for the global-stretch range so its domain matches static subtraction.
+        Dynamic background is deliberately NOT applied here — global stretch works
+        with static background only.
+
+        mean_dtype: cast mean_pattern (float64) down before the arithmetic. The range scan
+        passes float32 so a whole chunk isn't silently promoted to float64 (2x RAM) just
+        because the mean pattern is float64."""
+        out = chunk
+        if self.static_bg_chk.isChecked() and self.mean_pattern is not None:
+            mp = self.mean_pattern if mean_dtype is None else self.mean_pattern.astype(mean_dtype, copy=False)
+            if self.bg_mode.currentText() == "Subtract":
+                out = out - mp
+            else:
+                out = out / (mp + 1e-10)
+        return out
+
+    def _ensure_global_range(self):
+        """Compute dataset-wide (0.5, 99.5) percentile intensity bounds for the global
+        stretch, over ACTIVE pixels only (dead/vignetted corners excluded), AFTER applying
+        the current background settings so the range lives in the same domain it's applied
+        in. Cached and keyed by the background config; recomputed when that changes.
+
+        Two-pass streaming (background-applied values are signed floats, so a fixed uint8
+        histogram won't work):
+          pass 1 — global min/max of background-applied active pixels
+          pass 2 — 1024-bin histogram over [min,max] → 0.5/99.5 percentiles
+        Same (lo,hi) is then applied identically to every pattern → relative pattern-to-
+        pattern band contrast (and thus IQ ordering) is preserved.
+        """
+        key = self._bg_config_key()
+        if self.global_lo is not None and self._global_range_key == key:
+            return
+        ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
+        # Active-pixel mask over the pattern frame (exclude dead corners).
+        if self.pixel_std is not None:
+            p95 = float(np.percentile(self.pixel_std, 95))
+            active = self.pixel_std > (0.05 * p95)
+            if not active.any():
+                active = np.ones((ph, pw), dtype=bool)
+        else:
+            active = np.ones((ph, pw), dtype=bool)
+        active_flat = active.ravel()
+        n_avail_rows = getattr(self, 'n_actual_rows', self.nrows)
+        # Size chunk to the live host-RAM budget. float64 here was gratuitous: percentiles
+        # of 8-bit data don't need it, and it doubled every copy. Live per pixel:
+        # native read (1–2) + float32 cast (4) + bg-applied temporary (4) + the
+        # active-pixel gather (≤4) ≈ 13.
+        CHUNK_ROWS = self._host_chunk_rows(13, n_rows_total=max(n_avail_rows, 1))
+        print(f"[GLOBAL STRETCH] CHUNK_ROWS: {CHUNK_ROWS} of {n_avail_rows} rows")
+
+        # ---- Pass 1: global min/max of background-applied active pixels ----
+        self.statusBar().showMessage("Global range pass 1/2 (min/max)..."); QApplication.processEvents()
+        gmin, gmax = np.inf, -np.inf
+        for row_start in range(0, n_avail_rows, CHUNK_ROWS):
+            rows_to_read = min(CHUNK_ROWS, n_avail_rows - row_start)
+            chunk, _ = self.f_orig.read_data(returnArrayOnly=True, convertToFloat=False,
+                patStartCount=[[0, row_start], [self.ncols, rows_to_read]])
+            chunk = self._apply_static_background(chunk.astype(np.float32), mean_dtype=np.float32)
+            vals = chunk.reshape(chunk.shape[0], -1)[:, active_flat]
+            if vals.size:
+                gmin = min(gmin, float(vals.min())); gmax = max(gmax, float(vals.max()))
+            del chunk, vals
+            self.statusBar().showMessage(f"Global range p1: row {row_start + rows_to_read}/{n_avail_rows}")
+            QApplication.processEvents()
+        if not np.isfinite(gmin) or gmax <= gmin:
+            self.global_lo, self.global_hi = 0.0, 255.0
+            self._global_range_key = key
+            return
+
+        # ---- Pass 2: histogram over [gmin,gmax] → percentiles ----
+        self.statusBar().showMessage("Global range pass 2/2 (percentiles)..."); QApplication.processEvents()
+        NB = 1024
+        hist = np.zeros(NB, dtype=np.int64)
+        edges = np.linspace(gmin, gmax, NB + 1)
+        for row_start in range(0, n_avail_rows, CHUNK_ROWS):
+            rows_to_read = min(CHUNK_ROWS, n_avail_rows - row_start)
+            chunk, _ = self.f_orig.read_data(returnArrayOnly=True, convertToFloat=False,
+                patStartCount=[[0, row_start], [self.ncols, rows_to_read]])
+            chunk = self._apply_static_background(chunk.astype(np.float32), mean_dtype=np.float32)
+            vals = chunk.reshape(chunk.shape[0], -1)[:, active_flat].ravel()
+            hist += np.histogram(vals, bins=edges)[0]
+            del chunk, vals
+            self.statusBar().showMessage(f"Global range p2: row {row_start + rows_to_read}/{n_avail_rows}")
+            QApplication.processEvents()
+        total = hist.sum()
+        if total == 0:
+            self.global_lo, self.global_hi = gmin, gmax
+            self._global_range_key = key
+            return
+        cdf = np.cumsum(hist) / total
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        lo = float(centers[np.searchsorted(cdf, 0.005)])
+        hi = float(centers[min(np.searchsorted(cdf, 0.995), NB - 1)])
+        if hi <= lo:
+            hi = lo + (gmax - gmin) / NB
+        self.global_lo, self.global_hi = lo, hi
+        self._global_range_key = key
+        self.statusBar().showMessage(f"Global stretch range: [{lo:.2f}, {hi:.2f}] (0.5–99.5 pctile, bg-applied, active px)")
+        print(f"[GLOBAL STRETCH] in_range = [{lo:.3f}, {hi:.3f}] over {int(active.sum())}/{ph*pw} active px, bg_key={key}")
+
 
     def show_aperture_mask(self):
         """Preview the currently-selected aperture mask: shows the currently-selected
@@ -365,6 +563,10 @@ class MainWindow(QMainWindow):
         vram_budget = int(cp.cuda.Device(0).mem_info[1] * 0.5)
         CHUNK_ROWS = max(2, vram_budget // mem_per_row)
         CHUNK_ROWS = min(CHUNK_ROWS, self.nrows)
+        # Host RAM caps this too: the float32 read and the float32 `padded` block are both
+        # live at once (~4+4 B/px, plus border rows), and an 8.5 GB GPU on a 33 GB host can
+        # easily pick a chunk that fits VRAM but not RAM.
+        CHUNK_ROWS = min(CHUNK_ROWS, self._host_chunk_rows(12))
 
         for chunk_start in range(0, n_avail, CHUNK_ROWS):
             chunk_rows = min(CHUNK_ROWS, n_avail - chunk_start)
@@ -372,7 +574,8 @@ class MainWindow(QMainWindow):
             read_r1 = min(n_avail, chunk_start + chunk_rows + sr)
             data_np, _ = self.f_orig.read_data(returnArrayOnly=True, convertToFloat=True,
                 patStartCount=[[0, read_r0], [self.ncols, read_r1 - read_r0]])
-            data_np = data_np.reshape(read_r1 - read_r0, self.ncols, ph, pw).astype(np.float32)
+            # copy=False: read_data already returned float32, don't duplicate the block.
+            data_np = data_np.reshape(read_r1 - read_r0, self.ncols, ph, pw).astype(np.float32, copy=False)
 
             full_h = chunk_rows + 2 * sr
             full_w = self.ncols + 2 * sr
@@ -427,8 +630,11 @@ class MainWindow(QMainWindow):
         sigma_sq_map = np.zeros((self.nrows, self.ncols), dtype=np.float32)
         ap_flat = aperture_2d.ravel().astype(np.float64) if aperture_2d is not None else None
         n_avail = getattr(self, 'n_actual_rows', self.nrows)
-        # Stream row-by-row with 1-row borders.
-        CHUNK_ROWS = 8
+        # Stream with 1-row borders. float32 read + the float64 working copy are both live
+        # (12 B/px), so a fixed 8 rows was ~10 GB on a 430-col 479x479 scan. Keep float64
+        # for the SSD math (unchanged results); just size the chunk to fit RAM.
+        CHUNK_ROWS = self._host_chunk_rows(12, n_rows_total=max(n_avail, 1))
+        print(f"[SIGMA MAP CPU] CHUNK_ROWS: {CHUNK_ROWS} of {n_avail} rows")
         for chunk_start in range(0, n_avail, CHUNK_ROWS):
             chunk_rows = min(CHUNK_ROWS, n_avail - chunk_start)
             read_r0 = max(0, chunk_start - 1)
@@ -502,37 +708,105 @@ class MainWindow(QMainWindow):
         return self._read_pattern(self.f_orig)
 
     def process_pattern(self, pat):
+        """Single-pattern preview pipeline. Output range depends on normalize toggle:
+          normalize on  → returns values in [0, 1]
+          normalize off → returns values in absolute uint8 scale [0, 255]
+        The two output ranges are handled in update_display when picking display vmin/vmax,
+        and in apply_and_save / _process_chunk_batch when scaling to uint8 for the UP1 file.
+        """
         if pat is None: return None
         p = pat.astype(np.float64)
+        # ---- Aperture: statistics gate only [MVM 2026-09-08] ----
+        # The aperture is NEVER multiplied into pixel values. It only supplies the
+        # active-pixel boolean so per-pattern min/max, global stretch bounds and the
+        # CLAHE source range are computed over real signal. Without that, pmin would
+        # be pinned by the dead field and every pattern would be stretched against a
+        # denominator that is too large. Masked pixels flow through the pipeline
+        # untouched so they survive to the exported file.
+        ap = self._current_aperture()
+        ap_bool = None
+        if ap is not None:
+            ap_bool = ap > 0
         if self.static_bg_chk.isChecked() and self.mean_pattern is not None:
             if self.bg_mode.currentText() == "Subtract": p = p - self.mean_pattern
             else: p = p / (self.mean_pattern + 1e-10)
         if self.dyn_bg_chk.isChecked():
             p = p - gaussian_filter(p, sigma=self.dyn_sigma.value() / 10.0)
-        pmin, pmax = p.min(), p.max()
-        if pmax > pmin: p = (p - pmin) / (pmax - pmin)
+        normalize = self.normalize_chk.isChecked()
+        global_stretch = self.global_chk.isChecked()
         bval, cval = self.bright.value() / 100.0, self.cont.value() / 100.0
-        p = (p - 0.5) * (1.0 + cval) + 0.5 + bval
-        if self.clahe_chk.isChecked():
+        if global_stretch:
+            # Dataset-wide stretch: SAME (lo,hi) for every pattern → relative
+            # intensity preserved (IQ-safe). Output in [0,1] like per-pattern path.
+            self._ensure_global_range()
+            lo, hi = self.global_lo, self.global_hi
+            if hi > lo: p = (p - lo) / (hi - lo)
+            p = (p - 0.5) * (1.0 + cval) + 0.5 + bval
+            if self.clahe_chk.isChecked():
+                p = np.clip(p, 0, 1)
+                p = equalize_adapthist(p, clip_limit=self.clahe_clip.value() / 1000.0)
             p = np.clip(p, 0, 1)
-            p = equalize_adapthist(p, clip_limit=self.clahe_clip.value() / 1000.0)
-        return np.clip(p, 0, 1)
+            return p
+        if normalize:
+            # Per-pattern min-max stretch to [0,1], then B/C in [0,1] units (mid=0.5).
+            # min/max over ACTIVE pixels only — dead pixels must not set the range.
+            src = p[ap_bool] if ap_bool is not None else p
+            pmin, pmax = src.min(), src.max()
+            if pmax > pmin: p = (p - pmin) / (pmax - pmin)
+            p = (p - 0.5) * (1.0 + cval) + 0.5 + bval
+            if self.clahe_chk.isChecked():
+                p = np.clip(p, 0, 1)
+                p = equalize_adapthist(p, clip_limit=self.clahe_clip.value() / 1000.0)
+            p = np.clip(p, 0, 1)
+            return p
+        else:
+            # Preserve absolute intensity. B/C centered on the uint8 midpoint (127.5).
+            # bright slider [-100..100]/100 → bval is in [-1,1], scaled to ±255 here.
+            p = (p - 127.5) * (1.0 + cval) + 127.5 + bval * 255.0
+            if self.clahe_chk.isChecked():
+                # CLAHE requires [0,1]; temporarily scale per-pattern, apply, then
+                # map back to the same [pmin, pmax] absolute span we started with.
+                # This preserves the absolute intensity scale while still getting
+                # CLAHE's local-histogram redistribution.
+                src = p[ap_bool] if ap_bool is not None else p
+                pmin, pmax = src.min(), src.max()
+                if pmax > pmin:
+                    p_scaled = np.clip((p - pmin) / (pmax - pmin), 0, 1)
+                    p_scaled = equalize_adapthist(p_scaled, clip_limit=self.clahe_clip.value() / 1000.0)
+                    p = p_scaled * (pmax - pmin) + pmin
+            p = np.clip(p, 0, 255)
+            return p
 
     # ---- Batch processing (GPU-accelerated when available) ----
     def _process_chunk_batch(self, chunk, mask_rows):
         """Process a chunk of patterns in batch. chunk: (N, ph, pw) float64.
-        Returns processed chunk scaled to [0, 255] as float64."""
+        Returns processed chunk in float64, clipped to [0, 255] ready for uint8 write.
+        Mirrors process_pattern: when normalize is on, internal range is [0,1] and
+        we *255 at the end; when off, internal range stays in absolute uint8 scale
+        and we just clip."""
         N = chunk.shape[0]
         use_static = self.static_bg_chk.isChecked() and self.mean_pattern is not None
         use_dyn = self.dyn_bg_chk.isChecked()
         use_clahe = self.clahe_chk.isChecked()
+        normalize = self.normalize_chk.isChecked()
+        global_stretch = self.global_chk.isChecked()
+        if global_stretch:
+            self._ensure_global_range()
+            g_lo, g_hi = self.global_lo, self.global_hi
+        # [0,1]-domain flag: both per-pattern normalize and global stretch land in [0,1].
+        unit_domain = normalize or global_stretch
         sigma = self.dyn_sigma.value() / 10.0
         bval = self.bright.value() / 100.0
         cval = self.cont.value() / 100.0
         clip_limit = self.clahe_clip.value() / 1000.0
+        # Aperture gate, resolved once for the whole chunk. ap_bool is the CPU-side
+        # active-pixel boolean used by the CLAHE branch below.
+        ap = self._current_aperture()
+        ap_bool = (ap > 0) if ap is not None else None
 
         if HAS_GPU:
             d = cp.asarray(chunk, dtype=cp.float32)
+            g_ap = cp.asarray(ap, dtype=cp.float32) if ap is not None else None
 
             # Static background (broadcast across batch)
             if use_static:
@@ -547,21 +821,38 @@ class MainWindow(QMainWindow):
             if use_dyn:
                 d -= cp_ndimage.gaussian_filter(d, sigma=(0, sigma, sigma))
 
-            # Per-pattern normalize: compute min/max along pixel dims
-            flat = d.reshape(N, -1)
-            pmin = flat.min(axis=1).reshape(N, 1, 1)
-            pmax = flat.max(axis=1).reshape(N, 1, 1)
-            spread = pmax - pmin
-            valid = spread > 0
-            d = cp.where(valid, (d - pmin) / cp.where(valid, spread, cp.ones_like(spread)), d)
-            del flat, pmin, pmax, spread, valid
-
-            # Brightness / Contrast
-            d = (d - 0.5) * (1.0 + cval) + 0.5 + bval
+            if global_stretch:
+                # Dataset-wide stretch: same (lo,hi) for all → IQ-safe. Lands in [0,1].
+                if g_hi > g_lo:
+                    d = (d - cp.float32(g_lo)) / cp.float32(g_hi - g_lo)
+                d = (d - 0.5) * (1.0 + cval) + 0.5 + bval
+            elif normalize:
+                # Per-pattern normalize: compute min/max along pixel dims over ACTIVE
+                # pixels only. Dead pixels are pushed to ±inf so they can never win the
+                # reduction; otherwise pmin pins to 0 and every pattern is compressed.
+                flat = d.reshape(N, -1)
+                if g_ap is not None:
+                    act = (g_ap.reshape(1, -1) > 0)
+                    pmin = cp.where(act, flat, cp.float32(cp.inf)).min(axis=1).reshape(N, 1, 1)
+                    pmax = cp.where(act, flat, cp.float32(-cp.inf)).max(axis=1).reshape(N, 1, 1)
+                    del act
+                else:
+                    pmin = flat.min(axis=1).reshape(N, 1, 1)
+                    pmax = flat.max(axis=1).reshape(N, 1, 1)
+                spread = pmax - pmin
+                valid = spread > 0
+                d = cp.where(valid, (d - pmin) / cp.where(valid, spread, cp.ones_like(spread)), d)
+                del flat, pmin, pmax, spread, valid
+                # B/C in [0,1] units
+                d = (d - 0.5) * (1.0 + cval) + 0.5 + bval
+            else:
+                # Preserve absolute intensity. B/C centered on uint8 midpoint.
+                d = (d - cp.float32(127.5)) * (1.0 + cval) + cp.float32(127.5) + cp.float32(bval * 255.0)
 
             # Transfer back to CPU
             result = cp.asnumpy(d).astype(np.float64)
             del d
+            if g_ap is not None: del g_ap
             cp.get_default_memory_pool().free_all_blocks()
         else:
             # CPU fallback: vectorized numpy (still batched, no per-pattern loop)
@@ -578,25 +869,58 @@ class MainWindow(QMainWindow):
                 from scipy.ndimage import gaussian_filter as sp_gauss
                 result -= sp_gauss(result, sigma=(0, sigma, sigma))
 
-            flat = result.reshape(N, -1)
-            pmin = flat.min(axis=1).reshape(N, 1, 1)
-            pmax = flat.max(axis=1).reshape(N, 1, 1)
-            spread = pmax - pmin
-            valid = spread > 0
-            result = np.where(valid, (result - pmin) / np.where(valid, spread, np.ones_like(spread)), result)
+            if global_stretch:
+                if g_hi > g_lo:
+                    result = (result - g_lo) / (g_hi - g_lo)
+                result = (result - 0.5) * (1.0 + cval) + 0.5 + bval
+            elif normalize:
+                flat = result.reshape(N, -1)
+                if ap_bool is not None:
+                    act = ap_bool.reshape(1, -1)
+                    pmin = np.where(act, flat, np.inf).min(axis=1).reshape(N, 1, 1)
+                    pmax = np.where(act, flat, -np.inf).max(axis=1).reshape(N, 1, 1)
+                else:
+                    pmin = flat.min(axis=1).reshape(N, 1, 1)
+                    pmax = flat.max(axis=1).reshape(N, 1, 1)
+                spread = pmax - pmin
+                valid = spread > 0
+                result = np.where(valid, (result - pmin) / np.where(valid, spread, np.ones_like(spread)), result)
+                result = (result - 0.5) * (1.0 + cval) + 0.5 + bval
+            else:
+                result = (result - 127.5) * (1.0 + cval) + 127.5 + bval * 255.0
 
-            result = (result - 0.5) * (1.0 + cval) + 0.5 + bval
-
-        # CLAHE stays on CPU (per-pattern, no good batch GPU impl yet)
+        # CLAHE stays on CPU (per-pattern, no good batch GPU impl yet).
+        # When normalize is on, input is in [0,1] and we apply CLAHE directly.
+        # When off, we temporarily scale per-pattern to [0,1] for CLAHE then map
+        # back to the original [pmin, pmax] span to preserve absolute intensity.
         if use_clahe:
             for i in range(N):
                 if not mask_rows[i]:
                     continue
-                p = np.clip(result[i], 0, 1)
-                result[i] = equalize_adapthist(p, clip_limit=clip_limit)
+                if unit_domain:
+                    p = np.clip(result[i], 0, 1)
+                    result[i] = equalize_adapthist(p, clip_limit=clip_limit)
+                else:
+                    pi = result[i]
+                    src_i = pi[ap_bool] if ap_bool is not None else pi
+                    pmin_i, pmax_i = src_i.min(), src_i.max()
+                    if pmax_i > pmin_i:
+                        p_scaled = np.clip((pi - pmin_i) / (pmax_i - pmin_i), 0, 1)
+                        p_scaled = equalize_adapthist(p_scaled, clip_limit=clip_limit)
+                        result[i] = p_scaled * (pmax_i - pmin_i) + pmin_i
 
-        # Final scale to [0, 255] and zero masked patterns
-        result = np.clip(result * 255.0, 0, 255)
+        # Final scale to [0, 255]. When in unit domain (per-pattern normalize OR
+        # global stretch), data is in [0,1] so *255 first; when off, data is already
+        # in absolute uint8 scale so just clip.
+        if unit_domain:
+            result = np.clip(result * 255.0, 0, 255)
+        else:
+            result = np.clip(result, 0, 255)
+        # [MVM 2026-09-08] The aperture is deliberately NOT re-asserted here. It is a
+        # statistics gate only (min/max, global stretch bounds, CLAHE source range,
+        # N_p in NLPAR); masked pixels keep their own processed values and reach disk
+        # intact, so exported patterns are complete for OIM/EMSphInx/OpenXY.
+        # IQ-range exclusion below is a different thing and still zeroes whole patterns.
         result[~mask_rows] = 0.0
         return result
 
@@ -608,7 +932,11 @@ class MainWindow(QMainWindow):
     def update_display(self):
         if self.f_orig is None: return
         orig = self._read_pattern(self.f_orig)
-        self.raw_canvas.show_pattern(orig, f"Original [{self.current_col}, {self.current_row}]")
+        # Raw panel: true absolute uint8 scale (vmin=0, vmax=255). Patterns with
+        # weaker raw signal will visibly look dimmer, instead of being silently
+        # stretched to fill the colormap by matplotlib's auto-normalize.
+        self.raw_canvas.show_pattern(orig, f"Original [{self.current_col}, {self.current_row}]",
+                                     vmin=0, vmax=255)
         if self.iq_mask is not None and not self.iq_mask[self.current_row, self.current_col]:
             self.proc_canvas.show_pattern(None, "Excluded by IQ range"); return
         t0 = time.time()
@@ -620,15 +948,30 @@ class MainWindow(QMainWindow):
         if self.f_nlpar is not None: src = "NLPAR+"
         elif self.nlpar_chk.isChecked(): src = "NLPAR+"
         elif self.npar_chk.isChecked(): src = "NPAR+"
-        self.proc_canvas.show_pattern(processed,
-            f"{src}Processed [{self.current_col}, {self.current_row}]", fixed_range=True)
+        # Proc display range follows the normalize toggle:
+        #   normalize on  → output is in [0,1]  → fixed_range=True
+        #   normalize off → output is in absolute uint8 scale → vmin=0, vmax=255
+        # Using vmin=0,vmax=255 in the unnormalized case matches what apply_and_save
+        # actually writes to the UP1, so the preview is honest about the export.
+        if self.normalize_chk.isChecked() or self.global_chk.isChecked():
+            self.proc_canvas.show_pattern(processed,
+                f"{src}Processed [{self.current_col}, {self.current_row}]", fixed_range=True)
+        else:
+            self.proc_canvas.show_pattern(processed,
+                f"{src}Processed [{self.current_col}, {self.current_row}]",
+                vmin=0, vmax=255)
         self.statusBar().showMessage(f"Pattern processed in {elapsed*1000:.0f} ms")
 
     # ---- File loading ----
     def load_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open UP1 File",
-            r"D:\EBSD TKD Pattern Processing", "UP1 Files (*.up1)")
+            "", "UP1 Files (*.up1 *.up2)")
         if not path: return
+        self.load_path(path)
+
+    def load_path(self, path):
+        """Load a UP1/UP2 file by path (no dialog). Split out of load_file so the
+        loader can be driven headlessly for testing."""
         self.statusBar().showMessage("Loading patterns..."); QApplication.processEvents()
         self.orig_path = path; self.f_orig = ebsd_pattern.get_pattern_file_obj(path)
         self.nrows, self.ncols = self.f_orig.nRows, self.f_orig.nCols
@@ -647,23 +990,30 @@ class MainWindow(QMainWindow):
         else:
             self.n_actual_rows = self.nrows
             self.n_actual_pats = n_expected
-        # Chunked loading for IQ map and mean pattern (only read rows that exist)
-        CHUNK_ROWS = 20
+        # Chunked loading for IQ map and mean pattern (only read rows that exist).
+        # Read in the file's native dtype (uint8/uint16) and cast one chunk at a time:
+        # a 20-row float32 read of a 430x479x479 scan is ~8 GB before we touch it.
+        # Live per pixel: raw read (1–2) + float32 cast (4) + std/square temporaries (~8) ≈ 13.
+        CHUNK_ROWS = self._host_chunk_rows(13, n_rows_total=max(self.n_actual_rows, 1))
+        print(f"[LOAD] {ph}x{pw} patterns, CHUNK_ROWS: {CHUNK_ROWS} of {self.n_actual_rows} rows")
         iq_values = []
         mean_accum = np.zeros((ph, pw), dtype=np.float64)
         sumsq_accum = np.zeros((ph, pw), dtype=np.float64)  # for per-pixel std (variance-based aperture detection)
         total_pats = 0
         for row_start in range(0, self.n_actual_rows, CHUNK_ROWS):
             rows_to_read = min(CHUNK_ROWS, self.n_actual_rows - row_start)
-            chunk, _ = self.f_orig.read_data(returnArrayOnly=True, convertToFloat=True,
+            chunk, _ = self.f_orig.read_data(returnArrayOnly=True, convertToFloat=False,
                 patStartCount=[[0, row_start], [self.ncols, rows_to_read]])
-            iq_values.append(np.std(chunk, axis=(1, 2)))
-            mean_accum += np.sum(chunk, axis=0)
-            sumsq_accum += np.sum(chunk * chunk, axis=0)
+            cf = chunk.astype(np.float32)
+            iq_values.append(cf.std(axis=(1, 2)))
+            # Sum in float64: exact from the integer chunk; the squares keep float32
+            # precision (exact for uint8, same rounding as before for uint16).
+            mean_accum += chunk.sum(axis=0, dtype=np.float64)
+            sumsq_accum += np.square(cf).sum(axis=0, dtype=np.float64)
             total_pats += chunk.shape[0]
             self.statusBar().showMessage(f"Loading: row {row_start + rows_to_read}/{self.nrows}")
             QApplication.processEvents()
-            del chunk
+            del cf, chunk
         # Pad IQ map with zeros for missing rows
         iq_flat = np.concatenate(iq_values)
         if len(iq_flat) < self.nrows * self.ncols:
@@ -680,11 +1030,12 @@ class MainWindow(QMainWindow):
         self.iq_min_slider.setValue(0); self.iq_max_slider.setValue(1000); self._update_iq_range()
         self.f_nlpar = None; self.nlpar_status.setText("No NLPAR file loaded")
         self._invalidate_sigma_map()  # New file → σ² map must be recomputed
+        self._invalidate_global_range()  # New file → global stretch range must be recomputed
         self.on_pattern_clicked(0, 0); self.statusBar().showMessage("Ready")
 
     def load_nlpar_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open NLPAR UP1 File",
-            r"D:\EBSD TKD Pattern Processing", "UP1 Files (*.up1)")
+            "", "UP1 Files (*.up1 *.up2)")
         if not path: return
         self.f_nlpar = ebsd_pattern.get_pattern_file_obj(path)
         self.nlpar_chk.setChecked(False)  # disable on-demand since we have a file
@@ -699,13 +1050,17 @@ class MainWindow(QMainWindow):
         ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
         mean_accum = np.zeros((ph, pw), dtype=np.float64)
         n_avail_rows = getattr(self, 'n_actual_rows', self.nrows)
-        CHUNK_ROWS = 50
+        # Native-dtype read + a masked copy of at most the same size; the sum accumulates
+        # straight into float64 (exact for integer input). 50 rows of float32 here was
+        # ~20 GB on a 430-col 479x479 scan — that's the _ArrayMemoryError we hit.
+        CHUNK_ROWS = self._host_chunk_rows(3, n_rows_total=max(n_avail_rows, 1))
+        print(f"[BG] CHUNK_ROWS: {CHUNK_ROWS} of {n_avail_rows} rows")
         for row_start in range(0, n_avail_rows, CHUNK_ROWS):
             rows_to_read = min(CHUNK_ROWS, n_avail_rows - row_start)
-            chunk, _ = self.f_orig.read_data(returnArrayOnly=True, convertToFloat=True,
+            chunk, _ = self.f_orig.read_data(returnArrayOnly=True, convertToFloat=False,
                 patStartCount=[[0, row_start], [self.ncols, rows_to_read]])
             mask_flat = mask[row_start:row_start+rows_to_read, :].flatten()
-            if mask_flat.any(): mean_accum += np.sum(chunk[mask_flat], axis=0)
+            if mask_flat.any(): mean_accum += chunk[mask_flat].sum(axis=0, dtype=np.float64)
             del chunk
             self.statusBar().showMessage(f"Recomputing BG: row {row_start + rows_to_read}/{self.nrows}")
             QApplication.processEvents()
@@ -714,68 +1069,73 @@ class MainWindow(QMainWindow):
         self.bg_status.setText(f"Background: {n_valid}/{n_total} patterns")
         self.statusBar().showMessage(f"Background recomputed from {n_valid} patterns"); self.update_display()
 
-    def _write_masked_up1(self):
-        mask = self._get_iq_mask()
-        if mask.all(): return self.orig_path
-        self.statusBar().showMessage("Writing masked temp UP1..."); QApplication.processEvents()
-        tmp_dir = os.path.dirname(self.orig_path)
-        tmp_path = os.path.join(tmp_dir, "_temp_masked.up1")
-        ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
-        CHUNK_ROWS = 50
-        n_avail_rows = getattr(self, 'n_actual_rows', self.nrows)
-        ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
-        first_chunk = True
-        for row_start in range(0, self.nrows, CHUNK_ROWS):
-            rows_to_read = min(CHUNK_ROWS, self.nrows - row_start)
-            if row_start >= n_avail_rows:
-                chunk = np.zeros((rows_to_read * self.ncols, ph, pw), dtype=np.float64)
-            elif row_start + rows_to_read > n_avail_rows:
-                real_rows = n_avail_rows - row_start
-                real_chunk, _ = self.f_orig.read_data(returnArrayOnly=True, convertToFloat=True,
-                    patStartCount=[[0, row_start], [self.ncols, real_rows]])
-                pad = np.zeros(((rows_to_read - real_rows) * self.ncols, ph, pw), dtype=np.float64)
-                chunk = np.concatenate([real_chunk, pad], axis=0)
-                del real_chunk, pad
-            else:
-                chunk, _ = self.f_orig.read_data(returnArrayOnly=True, convertToFloat=True,
-                    patStartCount=[[0, row_start], [self.ncols, rows_to_read]])
-            mask_flat = mask[row_start:row_start+rows_to_read, :].flatten()
-            chunk[~mask_flat] = 0.0
-            if first_chunk:
-                tmp_obj = ebsd_pattern.get_pattern_file_obj(tmp_path)
-                tmp_obj.patternW = self.f_orig.patternW; tmp_obj.patternH = self.f_orig.patternH
-                tmp_obj.nCols = self.ncols; tmp_obj.nRows = self.nrows
-                tmp_obj.nPatterns = self.ncols * self.nrows
-                tmp_obj.xStep = self.f_orig.xStep; tmp_obj.yStep = self.f_orig.yStep
-                tmp_obj.hexflag = self.f_orig.hexflag
-                tmp_obj.extraPatterns = self.f_orig.extraPatterns; tmp_obj.version = self.f_orig.version
-                tmp_obj.filePos = self.f_orig.filePos
-                tmp_obj.write_data(newpatterns=chunk, patStartCount=[0, -1], writeHead=True)
-                # Copy extra header bytes (v4+ has 16 bytes between standard 42-byte header and filePos)
-                if self.f_orig.filePos > 42:
-                    with open(self.orig_path, 'rb') as f_src:
-                        f_src.seek(42)
-                        extra_hdr = f_src.read(self.f_orig.filePos - 42)
-                    with open(tmp_path, 'r+b') as f_dst:
-                        f_dst.seek(42)
-                        f_dst.write(extra_hdr)
-                first_chunk = False
-            else:
-                tmp_obj.write_data(newpatterns=chunk, patStartCount=[row_start * self.ncols, -1], writeHead=False)
-            del chunk
-            self.statusBar().showMessage(f"Writing masked UP1: row {row_start + rows_to_read}/{self.nrows}")
-            QApplication.processEvents()
-        self._temp_files.append(tmp_path)
-        return tmp_path
+    def _nlpar_chunk_bytes(self):
+        """Byte budget to hand pyebsdindex as `chunksize`.
+
+        pyebsdindex's _calcchunks assumes 8 bytes/pixel (a float32 input array plus a
+        float32 output array) when it turns this number into a tile size, so a 4 GB
+        budget means each in-memory float32 tile is about 2 GB. Its own default is
+        min(32 GB, total_RAM/4), which on a 33.7 GB machine asks for an 8.4 GB tile and
+        dies with _ArrayMemoryError on a 479x479 scan. Track AVAILABLE RAM instead so a
+        busy machine simply tiles smaller."""
+        if HAS_PSUTIL:
+            return int(min(4.0e9, 0.25 * psutil.virtual_memory().available))
+        return int(2.0e9)  # no psutil -> conservative fixed budget
 
     def optimize_lambda(self):
+        """Estimate the NLPAR lambda straight off self.orig_path — no temp copy at all.
+
+        Two deliberate departures from the old implementation:
+
+        * The IQ-range exclusion is NOT applied during lambda estimation. lambda is a
+          single global number (the median of three Nelder-Mead fits over the whole d2
+          population), so the patterns the IQ sliders exclude have negligible influence
+          on it. The old code materialised a fully masked duplicate of the scan just to
+          drop them, which meant a second copy of the dataset on disk (31 GB for a real
+          RKD scan) and float32 read chunks far larger than host RAM.
+        * The aperture is passed through as pyebsdindex's own pixel mask
+          (`nlobj.mask`). That is the canonical way to keep dead pixels out of d2:
+          calcsigma_cpu does `indices = self.mask.flatten().nonzero()[0]` and only those
+          pixels ever enter sigma or d2. Zeroing dead pixels in a temp file was both
+          wasteful and wrong — `automask=True` then laid pyebsdindex's circular mask on
+          top of it, so for RKD data lambda was fitted over
+          (circle INTERSECT detected-active) instead of the aperture the rest of the
+          viewer uses. automask is now False; for mode "Circular (EBSD)" the aperture we
+          hand over IS makeautomask, so that case is unchanged.
+        """
         if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1 file first"); return
-        tmp_path = self._write_masked_up1()
-        self.statusBar().showMessage("Optimizing lambda on masked data..."); QApplication.processEvents()
-        nlobj = nlpar.NLPAR(tmp_path, searchradius=self.sr_spin.value())
-        nlobj.opt_lambda(chunksize=0, automask=True, autoupdate=True, backsub=False)
-        self.lam_spin.setValue(nlobj.lam)
-        self.statusBar().showMessage(f"Optimal lambda: {nlobj.lam:.2f}")
+        try:
+            sr = self.sr_spin.value()
+            ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
+            nlobj = nlpar.NLPAR(self.orig_path, searchradius=sr)
+            # Truncated file: cap the scan rows pyebsdindex will read. getinfileobj()
+            # forces fID.nRows = self.nrows whenever self.nrows is not None, so setting
+            # the attribute here is enough (the constructor's nrows= kwarg does the same).
+            n_avail = getattr(self, 'n_actual_rows', self.nrows)
+            if n_avail < self.nrows:
+                nlobj.nrows = int(n_avail)
+            ap = self._current_aperture()
+            if ap is not None:
+                nlobj.mask = (ap > 0).astype(np.uint8)
+                N_p = int(nlobj.mask.sum())
+                ap_label = self.aperture_mode.currentText()
+            else:
+                N_p = ph * pw
+                ap_label = "None"
+            budget = self._nlpar_chunk_bytes()
+            print(f"[OPT LAMBDA] file={os.path.basename(self.orig_path)} SR={sr} "
+                  f"aperture={ap_label} N_p={N_p}/{ph*pw} ({100.0*N_p/(ph*pw):.1f}%) "
+                  f"rows={int(n_avail)}/{self.nrows} chunk_budget={budget/1e9:.2f} GB")
+            self.statusBar().showMessage(
+                f"Optimizing lambda (aperture={ap_label}, N_p={N_p})..."); QApplication.processEvents()
+            nlobj.opt_lambda(chunksize=budget, automask=False, autoupdate=True, backsub=False)
+            self.lam_spin.setValue(float(nlobj.lam))
+            print(f"[OPT LAMBDA] lambda = {float(nlobj.lam):.4f}  (N_p = {N_p})")
+            self.statusBar().showMessage(f"Optimal lambda: {float(nlobj.lam):.3f} (N_p={N_p})")
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.statusBar().showMessage("Optimize lambda failed")
+            QMessageBox.critical(self, "Optimize lambda failed", str(e))
 
     def apply_nlpar_batch(self):
         """Run NLPAR on the full dataset. Uses GPU shift-and-compare when available, else pyebsdindex CPU."""
@@ -783,7 +1143,14 @@ class MainWindow(QMainWindow):
         sr, lam = self.sr_spin.value(), self.lam_spin.value()
 
         if HAS_GPU:
-            self._apply_nlpar_gpu(sr, lam)
+            # The CPU path reports its own failures; only the GPU path needs a guard
+            # here so an OOM/driver error becomes a dialog instead of killing the app.
+            try:
+                self._apply_nlpar_gpu(sr, lam)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.statusBar().showMessage("NLPAR (GPU) failed")
+                QMessageBox.critical(self, "NLPAR (GPU) failed", str(e))
         else:
             self._apply_nlpar_cpu(sr, lam)
 
@@ -835,6 +1202,10 @@ class MainWindow(QMainWindow):
         vram_budget = int(cp.cuda.Device(0).mem_info[1] * 0.6)  # use 60% of total VRAM
         CHUNK_ROWS = max(2, vram_budget // mem_per_row)
         CHUNK_ROWS = min(CHUNK_ROWS, self.nrows)
+        # Host-side cap: float32 read + float32 `padded` + the float32 result pulled back
+        # from the GPU are all live at once (~12 B/px, plus border rows). Fitting VRAM is
+        # not the same as fitting RAM.
+        CHUNK_ROWS = min(CHUNK_ROWS, self._host_chunk_rows(12))
         print(f"[GPU NLPAR] Pattern: {ph}x{pw}, VRAM budget: {vram_budget/1e9:.1f} GB, CHUNK_ROWS: {CHUNK_ROWS}")
         first_write = True
 
@@ -850,7 +1221,8 @@ class MainWindow(QMainWindow):
             if read_r1 > read_r0:
                 data_np, _ = self.f_orig.read_data(returnArrayOnly=True, convertToFloat=True,
                     patStartCount=[[0, read_r0], [self.ncols, read_r1 - read_r0]])
-                data_np = data_np.reshape(read_r1 - read_r0, self.ncols, ph, pw).astype(np.float32)
+                # copy=False: read_data already returned float32, don't duplicate the block.
+                data_np = data_np.reshape(read_r1 - read_r0, self.ncols, ph, pw).astype(np.float32, copy=False)
             else:
                 data_np = np.zeros((0, self.ncols, ph, pw), dtype=np.float32)
 
@@ -972,24 +1344,67 @@ class MainWindow(QMainWindow):
         self.update_display()
 
     def _apply_nlpar_cpu(self, sr, lam):
-        """CPU fallback: run NLPAR via pyebsdindex."""
-        tmp_path = self._write_masked_up1()
-        self.statusBar().showMessage(f"Running NLPAR batch CPU (SR={sr}, lam={lam:.2f})..."); QApplication.processEvents()
-        t0 = time.time()
-        nlobj = nlpar.NLPAR(tmp_path, lam=lam, searchradius=sr)
-        nlobj.calcnlpar(chunksize=0, saturation_protect=True, automask=True, backsub=False)
-        elapsed = time.time() - t0
-        base = os.path.splitext(tmp_path)[0]
-        candidates = sorted(glob.glob(f"{base}_NLPAR*.up1"), key=os.path.getmtime, reverse=True)
-        if candidates:
-            self._temp_files.append(candidates[0])
-            self.f_nlpar = ebsd_pattern.get_pattern_file_obj(candidates[0])
-            self.nlpar_chk.setChecked(False)
-            self.nlpar_status.setText(f"Batch: SR={sr}, lam={lam:.2f} ({elapsed:.1f}s)")
-            self.statusBar().showMessage("NLPAR batch complete")
-        else:
-            QMessageBox.warning(self, "Warning", "NLPAR ran but output not found.")
-        self.update_display()
+        """CPU fallback: run pyebsdindex NLPAR straight off self.orig_path — no temp copy.
+
+        Matches the GPU path's contract on two points that the old implementation got
+        wrong because it fed NLPAR a pre-masked duplicate of the scan:
+
+        * Dead pixels KEEP their values in the output. They are excluded from the d2
+          statistics via `nlobj.mask` (pyebsdindex turns that into the `indices` array
+          that gates the d2 sums) but nlpar_nb still averages every pixel of the
+          neighbourhood, so a dead pixel comes out as the weighted average of its
+          neighbours' dead pixels — i.e. its original value — instead of the hard 0 the
+          masked temp file used to bake in.
+        * automask=False. The aperture we pass IS the viewer's aperture; letting
+          pyebsdindex add its circular mask on top would silently intersect the two.
+
+        Output goes to `_cpu_nlpar_result.up1` next to the input via calcnlpar's
+        `fileout=` (setoutfile -> copy_file(empty_data=True) clones the header and
+        reserves the file, then each tile is written in place). Without `fileout`
+        pyebsdindex names the file itself as `<stem>_NLPAR_l{lam}sr{sr}.up1`, so the
+        glob below is kept as a fallback."""
+        try:
+            self.statusBar().showMessage(f"Running NLPAR batch CPU (SR={sr}, lam={lam:.2f})..."); QApplication.processEvents()
+            t0 = time.time()
+            ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
+            nlobj = nlpar.NLPAR(self.orig_path, lam=lam, searchradius=sr)
+            n_avail = getattr(self, 'n_actual_rows', self.nrows)
+            if n_avail < self.nrows:
+                nlobj.nrows = int(n_avail)
+            ap = self._current_aperture()
+            if ap is not None:
+                nlobj.mask = (ap > 0).astype(np.uint8)
+                N_p = int(nlobj.mask.sum())
+                ap_label = self.aperture_mode.currentText()
+            else:
+                N_p = ph * pw
+                ap_label = "None"
+            out_path = os.path.join(os.path.dirname(self.orig_path), "_cpu_nlpar_result.up1")
+            budget = self._nlpar_chunk_bytes()
+            print(f"[CPU NLPAR] SR={sr} lam={lam:.3f} aperture={ap_label} "
+                  f"N_p={N_p}/{ph*pw} ({100.0*N_p/(ph*pw):.1f}%) "
+                  f"rows={int(n_avail)}/{self.nrows} chunk_budget={budget/1e9:.2f} GB -> {out_path}")
+            result_path = nlobj.calcnlpar(chunksize=budget, saturation_protect=True,
+                                          automask=False, backsub=False, fileout=out_path)
+            elapsed = time.time() - t0
+            if not (result_path and os.path.isfile(result_path)):
+                base = os.path.splitext(self.orig_path)[0]
+                candidates = sorted(glob.glob(f"{base}_NLPAR*.up1"), key=os.path.getmtime, reverse=True)
+                result_path = candidates[0] if candidates else None
+            if result_path and os.path.isfile(result_path):
+                if result_path not in self._temp_files:
+                    self._temp_files.append(result_path)
+                self.f_nlpar = ebsd_pattern.get_pattern_file_obj(result_path)
+                self.nlpar_chk.setChecked(False)
+                self.nlpar_status.setText(f"CPU NLPAR: SR={sr}, lam={lam:.2f} ({elapsed:.1f}s)")
+                self.statusBar().showMessage(f"NLPAR batch complete ({elapsed:.1f}s, N_p={N_p})")
+            else:
+                QMessageBox.warning(self, "Warning", "NLPAR ran but output not found.")
+            self.update_display()
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.statusBar().showMessage("NLPAR (CPU) failed")
+            QMessageBox.critical(self, "NLPAR (CPU) failed", str(e))
 
     def apply_and_save(self):
         """Save all processed patterns to a new UP1 file (chunked)."""
@@ -1015,27 +1430,35 @@ class MainWindow(QMainWindow):
             CHUNK_ROWS = max(2, vram_budget // mem_per_row)
             CHUNK_ROWS = min(CHUNK_ROWS, self.nrows)
         else:
-            CHUNK_ROWS = 20
+            CHUNK_ROWS = self.nrows
+        # VRAM is only half the story: the chunk also lives in host RAM as the native read
+        # (1–2 B/px) + the float64 cast the batch function needs (8) + the float64 result (8)
+        # + write-side uint8/uint16 conversion (~1) ≈ 18. Cap by whichever is tighter.
+        CHUNK_ROWS = min(CHUNK_ROWS, self._host_chunk_rows(18))
+        print(f"[SAVE] CHUNK_ROWS: {CHUNK_ROWS} of {self.nrows} rows")
         n_avail_rows = getattr(self, 'n_actual_rows', self.nrows)
         first_chunk = True; out_obj = None; n_saved = 0
         for row_start in range(0, self.nrows, CHUNK_ROWS):
             rows_to_read = min(CHUNK_ROWS, self.nrows - row_start)
-            # Read real data or generate zeros for missing rows
+            # Read real data or generate zeros for missing rows. Read in the file's native
+            # dtype and pad in the SAME dtype so the concatenate doesn't silently produce a
+            # float64 block before we even start; the float64 cast happens once, below.
+            read_dtype = getattr(src_fobj, 'filedatatype', np.uint8)
             if row_start >= n_avail_rows:
-                chunk = np.zeros((rows_to_read * self.ncols, ph, pw), dtype=np.float64)
+                chunk = np.zeros((rows_to_read * self.ncols, ph, pw), dtype=read_dtype)
             elif row_start + rows_to_read > n_avail_rows:
                 real_rows = n_avail_rows - row_start
-                real_chunk, _ = src_fobj.read_data(returnArrayOnly=True, convertToFloat=True,
+                real_chunk, _ = src_fobj.read_data(returnArrayOnly=True, convertToFloat=False,
                     patStartCount=[[0, row_start], [self.ncols, real_rows]])
                 pad_count = (rows_to_read - real_rows) * self.ncols
-                pad = np.zeros((pad_count, ph, pw), dtype=np.float64)
+                pad = np.zeros((pad_count, ph, pw), dtype=real_chunk.dtype)
                 chunk = np.concatenate([real_chunk, pad], axis=0)
                 del real_chunk, pad
             else:
-                chunk, _ = src_fobj.read_data(returnArrayOnly=True, convertToFloat=True,
+                chunk, _ = src_fobj.read_data(returnArrayOnly=True, convertToFloat=False,
                     patStartCount=[[0, row_start], [self.ncols, rows_to_read]])
             mask_rows = mask[row_start:row_start+rows_to_read, :].flatten()
-            # Batch process entire chunk (GPU-accelerated if available)
+            # Batch process entire chunk (GPU-accelerated if available); it expects float64.
             chunk = self._process_chunk_batch(chunk.astype(np.float64), mask_rows)
             n_saved += int(mask_rows.sum())
             # Write chunk
@@ -1079,6 +1502,41 @@ class MainWindow(QMainWindow):
         self.iq_min_lbl.setText(f"Min IQ: {vmin:.1f}"); self.iq_max_lbl.setText(f"Max IQ: {vmax:.1f}")
         self.scan_canvas.update_mask(self.iq_mask); self.update_display()
 
+    def _on_normalize_toggled(self, checked):
+        """Per-pattern and global stretch are mutually exclusive."""
+        if checked and self.global_chk.isChecked():
+            self.global_chk.blockSignals(True); self.global_chk.setChecked(False); self.global_chk.blockSignals(False)
+        self._sync_bg_controls()
+
+    def _on_global_toggled(self, checked):
+        """Per-pattern and global stretch are mutually exclusive."""
+        if checked and self.normalize_chk.isChecked():
+            self.normalize_chk.blockSignals(True); self.normalize_chk.setChecked(False); self.normalize_chk.blockSignals(False)
+        self._sync_bg_controls()
+
+    def _sync_bg_controls(self):
+        """Enforce the background/stretch interlocks by enabling/disabling controls:
+          - Static and dynamic background are mutually exclusive.
+          - Global stretch is coupled to the static domain, so it is unavailable
+            while dynamic background is active.
+        Controls that become unavailable are also UNCHECKED (not just greyed) so a
+        checked-but-disabled box can't keep affecting processing. Uses blockSignals
+        around state changes to avoid recursive/duplicate update_display calls."""
+        dyn_on = self.dyn_bg_chk.isChecked()
+        static_on = self.static_bg_chk.isChecked()
+        # Dynamic active → static and global stretch are disabled (and unchecked).
+        for w, should_disable in ((self.static_bg_chk, dyn_on), (self.global_chk, dyn_on)):
+            if should_disable and w.isChecked():
+                w.blockSignals(True); w.setChecked(False); w.blockSignals(False)
+            w.setEnabled(not should_disable)
+        # Static (or global, which implies static domain) active → dynamic disabled.
+        block_dyn = static_on or self.global_chk.isChecked()
+        if block_dyn and self.dyn_bg_chk.isChecked():
+            self.dyn_bg_chk.blockSignals(True); self.dyn_bg_chk.setChecked(False); self.dyn_bg_chk.blockSignals(False)
+        self.dyn_bg_chk.setEnabled(not block_dyn)
+        # Mean/range domain may have changed → invalidate cached global range.
+        self._invalidate_global_range()
+
     def _build_ui(self):
         central = QWidget(); self.setCentralWidget(central); main_lay = QHBoxLayout(central)
         ctrl = QWidget(); ctrl.setFixedWidth(310); cl = QVBoxLayout(ctrl)
@@ -1097,6 +1555,32 @@ class MainWindow(QMainWindow):
         self.file_label = QLabel("No file loaded"); self.file_label.setWordWrap(True)
         btn = QPushButton("Load UP1"); btn.clicked.connect(self.load_file)
         gl.addWidget(self.file_label); gl.addWidget(btn); cl.addWidget(g)
+
+        # Aperture mask — GLOBAL gate, applied before every other operation.
+        # None / Circular (EBSD) / Auto-detect (variance-based, e.g. RKD quad-chip).
+        # When active, dead pixels are zeroed on read and re-zeroed after the last
+        # operation, and every statistic that would otherwise be biased by that field
+        # of zeros (per-pattern min/max, global percentiles, NLPAR N_p and σ²) is
+        # computed over active pixels only.
+        g = QGroupBox("Aperture Mask (applied before all processing)"); gl = QFormLayout(g)
+        self.aperture_mode = QComboBox()
+        self.aperture_mode.addItems(["None", "Circular (EBSD)", "Auto-detect"])
+        self.aperture_mode.setCurrentIndex(0)  # default None
+        self.aperture_mode.setMinimumContentsLength(15)  # ensure "Circular (EBSD)" fits without ellipsis
+        self.aperture_mode.currentIndexChanged.connect(lambda *_: self._on_aperture_changed())
+        gl.addRow("Mode:", self.aperture_mode)
+        self.aperture_thresh_spin = QDoubleSpinBox()
+        self.aperture_thresh_spin.setRange(0.001, 1.0)
+        self.aperture_thresh_spin.setValue(0.05)
+        self.aperture_thresh_spin.setSingleStep(0.01)
+        self.aperture_thresh_spin.setDecimals(3)
+        self.aperture_thresh_spin.setToolTip("Auto-detect threshold as fraction of 95th-percentile pixel std")
+        self.aperture_thresh_spin.valueChanged.connect(lambda *_: self._on_aperture_changed())
+        gl.addRow("Threshold:", self.aperture_thresh_spin)
+        b_show_mask = QPushButton("Show detected mask")
+        b_show_mask.clicked.connect(self.show_aperture_mask)
+        gl.addRow(b_show_mask)
+        cl.addWidget(g)
 
         # IQ Range
         g = QGroupBox("IQ Range (excludes patterns outside range)"); gl = QVBoxLayout(g)
@@ -1127,25 +1611,6 @@ class MainWindow(QMainWindow):
         self.lam_spin.valueChanged.connect(self.update_display)
         gl.addRow(self.nlpar_chk)
         gl.addRow("Search Radius:", self.sr_spin); gl.addRow("Lambda:", self.lam_spin)
-        # Aperture mask: None / Circular (EBSD) / Auto-detect (variance-based, e.g. RKD)
-        self.aperture_mode = QComboBox()
-        self.aperture_mode.addItems(["None", "Circular (EBSD)", "Auto-detect"])
-        self.aperture_mode.setCurrentIndex(0)  # default None
-        self.aperture_mode.setMinimumContentsLength(15)  # ensure "Circular (EBSD)" fits without ellipsis
-        # Aperture changes N_p → invalidate σ² map so it recomputes for the new aperture.
-        self.aperture_mode.currentIndexChanged.connect(lambda *_: self._invalidate_sigma_map())
-        gl.addRow("Aperture mask:", self.aperture_mode)
-        self.aperture_thresh_spin = QDoubleSpinBox()
-        self.aperture_thresh_spin.setRange(0.001, 1.0)
-        self.aperture_thresh_spin.setValue(0.05)
-        self.aperture_thresh_spin.setSingleStep(0.01)
-        self.aperture_thresh_spin.setDecimals(3)
-        self.aperture_thresh_spin.setToolTip("Auto-detect threshold as fraction of 95th-percentile pixel std")
-        self.aperture_thresh_spin.valueChanged.connect(lambda *_: self._invalidate_sigma_map())
-        gl.addRow("Threshold:", self.aperture_thresh_spin)
-        b_show_mask = QPushButton("Show detected mask")
-        b_show_mask.clicked.connect(self.show_aperture_mask)
-        gl.addRow(b_show_mask)
         b1 = QPushButton("Optimize Lambda"); b1.clicked.connect(self.optimize_lambda)
         b2 = QPushButton("Apply NLPAR to Full Dataset (GPU)" if HAS_GPU else "Apply NLPAR to Full Dataset (CPU)"); b2.clicked.connect(self.apply_nlpar_batch)
         b3 = QPushButton("Load Existing NLPAR UP1"); b3.clicked.connect(self.load_nlpar_file)
@@ -1155,6 +1620,7 @@ class MainWindow(QMainWindow):
         # Static BG
         g = QGroupBox("Static Background"); gl = QVBoxLayout(g)
         self.static_bg_chk = QCheckBox("Enable"); self.static_bg_chk.stateChanged.connect(self.update_display)
+        self.static_bg_chk.toggled.connect(lambda *_: self._sync_bg_controls())
         self.bg_mode = QComboBox(); self.bg_mode.addItems(["Subtract", "Divide"])
         self.bg_mode.currentIndexChanged.connect(self.update_display)
         b_recomp = QPushButton("Recompute Background (from IQ range)")
@@ -1166,11 +1632,48 @@ class MainWindow(QMainWindow):
         # Dynamic BG
         g = QGroupBox("Dynamic Background"); gl = QVBoxLayout(g)
         self.dyn_bg_chk = QCheckBox("Enable"); self.dyn_bg_chk.stateChanged.connect(self.update_display)
+        self.dyn_bg_chk.toggled.connect(lambda *_: self._sync_bg_controls())
         self.dyn_sigma_lbl = QLabel("Sigma: 5.0")
         self.dyn_sigma = QSlider(Qt.Horizontal); self.dyn_sigma.setRange(1, 200); self.dyn_sigma.setValue(50)
         self.dyn_sigma.valueChanged.connect(self.update_display)
         self.dyn_sigma.valueChanged.connect(lambda v: self.dyn_sigma_lbl.setText(f"Sigma: {v/10:.1f}"))
         gl.addWidget(self.dyn_bg_chk); gl.addWidget(self.dyn_sigma_lbl); gl.addWidget(self.dyn_sigma); cl.addWidget(g)
+
+        # Normalization — per-pattern min-max stretch to [0,1].
+        # When ON  (default): every pattern is independently stretched to fill the
+        #   display range. Equalizes the visual appearance across the scan but
+        #   hides absolute intensity differences (e.g. detector gain drift).
+        # When OFF: absolute uint8 intensity is preserved end-to-end (preview AND
+        #   exported UP1). Dim patterns look dim. Use this if you want the saved
+        #   patterns to reflect the actual signal level recorded by the detector.
+        g = QGroupBox("Normalization"); gl = QVBoxLayout(g)
+        self.normalize_chk = QCheckBox("Per-pattern stretch to [0,1]")
+        self.normalize_chk.setChecked(True)
+        self.normalize_chk.setToolTip(
+            "ON: each pattern independently stretched to fill the display range.\n"
+            "OFF: absolute uint8 intensity preserved in preview AND exported UP1.\n"
+            "Turn OFF to see real intensity differences across the scan (e.g. detector gain steps)."
+        )
+        self.normalize_chk.stateChanged.connect(self.update_display)
+        gl.addWidget(self.normalize_chk)
+        # Global stretch — dataset-wide percentile stretch (mutually exclusive with per-pattern).
+        # Same (lo,hi) applied to every pattern, from the 0.5/99.5 percentiles over
+        # ACTIVE pixels (dead detector corners excluded). Unlike per-pattern stretch,
+        # this preserves RELATIVE intensity across patterns → safe for downstream IQ
+        # (OIM/EMsoft) since it does not reorder pattern-to-pattern band contrast.
+        # Carries into both the preview and the exported UP1.
+        self.global_chk = QCheckBox("Global stretch (dataset 0.5–99.5 pctile)")
+        self.global_chk.setChecked(False)
+        self.global_chk.setToolTip(
+            "Dataset-wide stretch: one (lo,hi) for ALL patterns, from the 0.5/99.5\n"
+            "percentiles over active pixels (dead corners excluded).\n"
+            "Preserves relative intensity across patterns (IQ-safe). Mutually\n"
+            "exclusive with per-pattern stretch. Applies to preview AND saved UP1."
+        )
+        self.normalize_chk.toggled.connect(self._on_normalize_toggled)
+        self.global_chk.toggled.connect(self._on_global_toggled)
+        self.global_chk.stateChanged.connect(self.update_display)
+        gl.addWidget(self.global_chk); cl.addWidget(g)
 
         # Brightness / Contrast
         g = QGroupBox("Brightness / Contrast"); gl = QVBoxLayout(g)

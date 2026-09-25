@@ -1,0 +1,11 @@
+# Core (required)
+PyQt5>=5.15
+pyebsdindex>=0.3.9
+numpy>=2.0
+scipy>=1.14
+scikit-image>=0.24
+matplotlib>=3.8
+psutil>=5.9
+
+# GPU (optional) - install separately, pick the variant matching `module load cuda`:
+#   pip install cupy-cuda12x

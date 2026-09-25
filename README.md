@@ -61,8 +61,8 @@ turned out to be useful enough to publish.
 
 ```
 gpu_pattern_viewer.py     Main application (~1200 lines, single-file PyQt5 GUI)
-gpu_pattern_viewer.bat    Windows launcher (hardcoded to author Python path —
-                          edit before use)
+gpu_pattern_viewer.bat    Windows launcher (calls `python` from PATH — edit
+                          if your interpreter is named differently)
 compare_patterns.py       Static side-by-side plot of one original vs NLPAR pattern
 interactive_compare.py    Clickable IQ map → side-by-side original / NLPAR
 run_nlpar.py              Headless NLPAR runner (opt_lambda + calcnlpar)
@@ -96,8 +96,7 @@ pip install cupy-cuda12x   # only if you have CUDA; pick the matching variant
 python gpu_pattern_viewer.py
 ```
 
-or double-click `gpu_pattern_viewer.bat` after editing its Python path to match
-your install.
+or, on Windows, double-click `gpu_pattern_viewer.bat`.
 
 ---
 
