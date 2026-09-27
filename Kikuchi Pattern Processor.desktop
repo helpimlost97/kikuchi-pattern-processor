@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Kikuchi Pattern Processor
+Comment=NPAR/NLPAR Kikuchi pattern viewer (uses all cores of the current OnDemand desktop job)
+Exec=bash -lc "bash $HOME/EBSD/kikuchi-pattern-processor/run_gui.sh; echo; echo '[app exited - press Enter to close]'; read"
+Icon=applications-science
+Terminal=true
+Categories=Science;Education;

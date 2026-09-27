@@ -26,6 +26,7 @@ Thumbs.db
 # Temp / intermediate files this app writes
 _temp_masked.up1
 _gpu_nlpar_result.up1
+_cpu_nlpar_result.up1
 
 # Logs
 *.log

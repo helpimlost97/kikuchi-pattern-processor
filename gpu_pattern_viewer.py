@@ -1,6 +1,27 @@
 import sys
 import os
 import glob
+
+# ---------------------------------------------------------------------------
+# OSC / Linux CPU-node support [MVM+Claude 2026-09-25]
+# On a SLURM node the process only owns the cores/RAM it asked for, not the
+# whole machine (Cardinal: 104 cores, ~500 GB). os.sched_getaffinity sees the
+# cpuset SLURM pinned us to; the cgroup memory limit is what the OOM killer
+# enforces, while psutil reports node-wide numbers. Everything CPU-parallel
+# below sizes itself from these two helpers.
+# ---------------------------------------------------------------------------
+def n_workers():
+    """Worker threads for the CPU paths (override with KPP_THREADS=<n>)."""
+    env = os.environ.get('KPP_THREADS')
+    if env:
+        try: return max(1, int(env))
+        except ValueError: pass
+    try: return max(1, len(os.sched_getaffinity(0)))
+    except Exception: return max(1, os.cpu_count() or 1)
+
+# numba reads NUMBA_NUM_THREADS at import time; pyebsdindex (NLPAR) imports numba.
+os.environ.setdefault('NUMBA_NUM_THREADS', str(n_workers()))
+
 import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -15,6 +36,7 @@ from pyebsdindex import ebsd_pattern, nlpar
 from scipy.ndimage import gaussian_filter
 from skimage.exposure import equalize_adapthist
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 # Console prints use σ/λ/—; when stdout is a pipe/file on Windows it defaults to
 # cp1252 and a bare print would raise UnicodeEncodeError mid-run. Degrade to '?'.
@@ -43,6 +65,99 @@ try:
     HAS_PSUTIL = True
 except Exception:
     HAS_PSUTIL = False
+
+def _cgroup_headroom():
+    """Bytes this process may still allocate under its cgroup (v2) memory limits, or None
+    if unlimited. Walks from our own cgroup up to the root and takes the tightest level.
+
+    `memory.current` counts the page cache too, and a 32 GB pattern file just read through
+    the cache shows up as 32 GB "used" although the kernel reclaims cache on demand (it is
+    not what the OOM killer counts against us). Charging it made available_ram() collapse
+    to ~5 GB right after loading the Ni scan on the login node (64 GB user cap), which
+    starved every threaded pass down to 1 thread. So reclaimable file cache
+    (`memory.stat: file`) is subtracted from `current` at each level."""
+    try:
+        with open('/proc/self/cgroup') as f:
+            rel = [l.split(':', 2)[2].strip() for l in f if l.startswith('0::')][0]
+    except Exception:
+        return None
+    parts = [p for p in rel.split('/') if p]
+    best = None
+    for i in range(len(parts), -1, -1):
+        d = '/sys/fs/cgroup/' + '/'.join(parts[:i])
+        try:
+            with open(d + '/memory.max') as f: lim = f.read().strip()
+            if lim == 'max': continue
+            lim = int(lim)
+            with open(d + '/memory.current') as f: cur = int(f.read().strip())
+            cache = 0
+            with open(d + '/memory.stat') as f:
+                for line in f:
+                    if line.startswith('file '): cache = int(line.split()[1]); break
+        except Exception:
+            continue
+        head = max(lim - max(cur - cache, 0), 0)
+        best = head if best is None else min(best, head)
+    return best
+
+def available_ram():
+    """Bytes we can actually allocate: min(what psutil sees, what the SLURM cgroup allows)."""
+    avail = int(psutil.virtual_memory().available) if HAS_PSUTIL else int(8e9)
+    head = _cgroup_headroom()
+    if head is not None:
+        avail = min(avail, head)
+    return avail
+
+print(f"[CPU] {n_workers()} worker threads, {available_ram()/1e9:.1f} GB RAM available to this process")
+
+
+
+def read_patterns_parallel(path, offset, n_pat, ph, pw, dtype, out=None, nthr=None,
+                           progress=None, min_bytes=32 << 20, drop_cache=False):
+    """Read n_pat consecutive patterns starting at byte `offset` of `path` into an
+    (n_pat, ph, pw) array, several threads each streaming one contiguous byte range.
+
+    Why not pyebsdindex's slab reader: it zero-fills the block, then reads and copies
+    it row by row through np.fromfile in ONE stream. Measured on Cardinal (Ni RKD scan
+    in home, 2026-09-27): a single stream tops out at 130-220 MB/s on home NFS while
+    8 streams reach ~830 MB/s; the row-by-row copy alone costs ~20 s per 32 GB even
+    from the page cache. This reads straight into the destination buffer, no copies.
+    `progress(done_bytes, total_bytes)` is called from the CALLING thread every 0.2 s
+    (safe to touch Qt from it). drop_cache=True tells the kernel it may discard the
+    page cache of the range just read (posix_fadvise DONTNEED): used when the bytes now
+    live in our own array, so the cache copy is dead weight in the cgroup accounting."""
+    itemsize = np.dtype(dtype).itemsize
+    total = int(n_pat) * int(ph) * int(pw) * itemsize
+    if out is None:
+        out = np.empty((int(n_pat), int(ph), int(pw)), dtype=dtype)
+    buf = memoryview(out).cast('B')                      # flat byte view of the output
+    nthr = max(1, min(int(nthr or n_workers()), 16, max(1, total // int(min_bytes))))
+    bounds = np.linspace(0, total, nthr + 1, dtype=np.int64)
+    done = [0] * nthr
+
+    def work(i):
+        a, b = int(bounds[i]), int(bounds[i + 1])
+        with open(path, 'rb', buffering=0) as f:
+            f.seek(int(offset) + a); pos = a
+            while pos < b:
+                k = f.readinto(buf[pos:b])               # a single read may come back short
+                if not k:
+                    raise IOError(f"{path}: short read at byte {int(offset) + pos} (file truncated?)")
+                pos += k; done[i] = pos - a
+            if drop_cache:
+                try: os.posix_fadvise(f.fileno(), int(offset) + a, b - a, os.POSIX_FADV_DONTNEED)
+                except Exception: pass
+
+    with ThreadPoolExecutor(max_workers=nthr) as pool:
+        futs = [pool.submit(work, i) for i in range(nthr)]
+        if progress is not None:
+            while not all(f.done() for f in futs):
+                progress(sum(done), total); time.sleep(0.2)
+        for f in futs:
+            f.result()
+    if progress is not None:
+        progress(total, total)
+    return out
 
 
 class ScanMapCanvas(FigureCanvas):
@@ -127,8 +242,17 @@ class PatternCanvas(FigureCanvas):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("EBSD Pattern Processor (GPU Accelerated)" if HAS_GPU else "EBSD Pattern Processor (CPU Mode)"); self.setGeometry(100, 100, 1400, 900)
+        self.setWindowTitle("EBSD Pattern Processor (GPU Accelerated)" if HAS_GPU else f"EBSD Pattern Processor (CPU Mode, {n_workers()} threads)"); self.setGeometry(100, 100, 1400, 900)
         self.orig_path = None; self.f_orig = self.f_nlpar = None
+        # Tier 1 (2026-09-27): the raw dataset held in RAM as one (npat, ph, pw) array in
+        # the file's native dtype, when it fits. Every whole-dataset pass then slices this
+        # instead of re-streaming the file (each pass was a full 32 GB read from home NFS).
+        self.patterns = None
+        # Workflow gates (2026-09-27, for students using the app unassisted):
+        # Optimize lambda -> Apply NLPAR to full dataset -> Apply && Save. Set when
+        # optimize_lambda succeeds; cleared on file load and aperture change (lambda is
+        # fitted for one pixel mask). Editing the lambda box by hand does NOT clear it.
+        self._lambda_optimized = False
         self.nrows = self.ncols = self.current_row = self.current_col = 0
         self.mean_pattern = None; self.iq_map = None; self.iq_mask = None
         self.pixel_std = None  # per-pixel std across dataset, for variance-based aperture detection
@@ -149,11 +273,19 @@ class MainWindow(QMainWindow):
         self._global_range_key = None
         self._build_ui()
 
-    def closeEvent(self, event):
+    def _remove_temp_files(self):
+        """Delete the NLPAR batch result files this session created (next to their
+        inputs). Called on app exit and when a new dataset is loaded (Max, 2026-09-27),
+        so a 5-32 GB _cpu_nlpar_result.up1 doesn't sit around until the app closes."""
         for f in self._temp_files:
             try:
-                if os.path.isfile(f): os.remove(f)
-            except: pass
+                if os.path.isfile(f): os.remove(f); print(f"[TEMP] removed {f}")
+            except Exception as e:
+                print(f"[TEMP] could not remove {f}: {e}")
+        self._temp_files = []
+
+    def closeEvent(self, event):
+        self._remove_temp_files()
         event.accept()
 
     def _get_iq_mask(self):
@@ -213,6 +345,7 @@ class MainWindow(QMainWindow):
         Every cache that depends on it must be dropped and the preview refreshed."""
         self._invalidate_sigma_map()
         self._invalidate_global_range()
+        self._lambda_optimized = False  # lambda was fitted for the previous aperture
         if self.f_orig is not None:
             self.update_display()
 
@@ -239,10 +372,11 @@ class MainWindow(QMainWindow):
         the smaller of 3 GB and a quarter of the currently AVAILABLE RAM, so a busy machine
         chunks smaller instead of swapping (or dying with _ArrayMemoryError)."""
         if budget is None:
-            if HAS_PSUTIL:
-                budget = min(3.0e9, 0.25 * psutil.virtual_memory().available)
-            else:
-                budget = 1.5e9  # no psutil → conservative fixed budget
+            # Was min(3 GB, 25% of available). On a 500 GB OSC node that meant 1-row chunks
+            # (a 430-col 479x479 row is ~1.8 GB at 18 B/px), starving the threaded paths.
+            # Scale the cap with the thread count, but never exceed a quarter of what the
+            # SLURM cgroup actually lets us allocate.
+            budget = min(1.0e9 * max(4, n_workers() // 2), 0.25 * available_ram())
         ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
         bytes_per_row = self.ncols * ph * pw * float(bytes_per_pixel_live)
         n_total = n_rows_total if n_rows_total is not None else self.nrows
@@ -323,8 +457,7 @@ class MainWindow(QMainWindow):
         gmin, gmax = np.inf, -np.inf
         for row_start in range(0, n_avail_rows, CHUNK_ROWS):
             rows_to_read = min(CHUNK_ROWS, n_avail_rows - row_start)
-            chunk, _ = self.f_orig.read_data(returnArrayOnly=True, convertToFloat=False,
-                patStartCount=[[0, row_start], [self.ncols, rows_to_read]])
+            chunk = self._read_rows(self.f_orig, row_start, rows_to_read)
             chunk = self._apply_static_background(chunk.astype(np.float32), mean_dtype=np.float32)
             vals = chunk.reshape(chunk.shape[0], -1)[:, active_flat]
             if vals.size:
@@ -344,8 +477,7 @@ class MainWindow(QMainWindow):
         edges = np.linspace(gmin, gmax, NB + 1)
         for row_start in range(0, n_avail_rows, CHUNK_ROWS):
             rows_to_read = min(CHUNK_ROWS, n_avail_rows - row_start)
-            chunk, _ = self.f_orig.read_data(returnArrayOnly=True, convertToFloat=False,
-                patStartCount=[[0, row_start], [self.ncols, rows_to_read]])
+            chunk = self._read_rows(self.f_orig, row_start, rows_to_read)
             chunk = self._apply_static_background(chunk.astype(np.float32), mean_dtype=np.float32)
             vals = chunk.reshape(chunk.shape[0], -1)[:, active_flat].ravel()
             hist += np.histogram(vals, bins=edges)[0]
@@ -416,8 +548,7 @@ class MainWindow(QMainWindow):
             ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
             dummy = np.zeros((1, 1, ph, pw))
             return dummy, np.ones((1, 1), dtype=bool), 0, 0
-        pats, _ = fobj.read_data(returnArrayOnly=True, convertToFloat=True,
-            patStartCount=[[c0, r0], [n_cols_read, n_rows_read]])
+        pats = self._read_rows(fobj, r0, n_rows_read, c0, n_cols_read, as_float=True)
         ph, pw = int(fobj.patternH), int(fobj.patternW)
         pats = pats.reshape(n_rows_read, n_cols_read, ph, pw)
         # Build mask for this neighborhood
@@ -572,8 +703,7 @@ class MainWindow(QMainWindow):
             chunk_rows = min(CHUNK_ROWS, n_avail - chunk_start)
             read_r0 = max(0, chunk_start - sr)
             read_r1 = min(n_avail, chunk_start + chunk_rows + sr)
-            data_np, _ = self.f_orig.read_data(returnArrayOnly=True, convertToFloat=True,
-                patStartCount=[[0, read_r0], [self.ncols, read_r1 - read_r0]])
+            data_np = self._read_rows(self.f_orig, read_r0, read_r1 - read_r0, as_float=True)
             # copy=False: read_data already returned float32, don't duplicate the block.
             data_np = data_np.reshape(read_r1 - read_r0, self.ncols, ph, pw).astype(np.float32, copy=False)
 
@@ -625,46 +755,62 @@ class MainWindow(QMainWindow):
         return sigma_sq_map
 
     def _compute_sigma_map_cpu(self, aperture_2d, N_p):
-        """CPU fallback σ² estimation. Slower but matches GPU output."""
+        """CPU σ² estimation, vectorized per scan row and threaded across rows.
+
+        Same quantity as before (min over the 8 neighbours of the aperture-weighted SSD,
+        divided by 2·N_p): patterns are uint8/uint16 so the float32 differences and their
+        squares are exact, and the sums accumulate in float64 as the old loop did. Each
+        (row, neighbour offset) is one array op over all columns instead of a Python loop
+        over patterns, and the rows of a chunk are spread over a thread pool (numpy
+        releases the GIL in these ops)."""
         ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
-        sigma_sq_map = np.zeros((self.nrows, self.ncols), dtype=np.float32)
-        ap_flat = aperture_2d.ravel().astype(np.float64) if aperture_2d is not None else None
+        npix = ph * pw
+        ncols = int(self.ncols)  # pyebsdindex gives numpy uint64; keep index math in Python ints
+        sigma_sq_map = np.zeros((int(self.nrows), ncols), dtype=np.float32)
+        ap_flat = aperture_2d.ravel().astype(np.float32) if aperture_2d is not None else None
         n_avail = getattr(self, 'n_actual_rows', self.nrows)
-        # Stream with 1-row borders. float32 read + the float64 working copy are both live
-        # (12 B/px), so a fixed 8 rows was ~10 GB on a 430-col 479x479 scan. Keep float64
-        # for the SSD math (unchanged results); just size the chunk to fit RAM.
-        CHUNK_ROWS = self._host_chunk_rows(12, n_rows_total=max(n_avail, 1))
-        print(f"[SIGMA MAP CPU] CHUNK_ROWS: {CHUNK_ROWS} of {n_avail} rows")
-        for chunk_start in range(0, n_avail, CHUNK_ROWS):
-            chunk_rows = min(CHUNK_ROWS, n_avail - chunk_start)
-            read_r0 = max(0, chunk_start - 1)
-            read_r1 = min(n_avail, chunk_start + chunk_rows + 1)
-            data, _ = self.f_orig.read_data(returnArrayOnly=True, convertToFloat=True,
-                patStartCount=[[0, read_r0], [self.ncols, read_r1 - read_r0]])
-            data = data.reshape(read_r1 - read_r0, self.ncols, ph, pw).astype(np.float64)
-            for r in range(chunk_rows):
-                gr = chunk_start + r       # global row index
-                lr = r + (chunk_start - read_r0)  # local row index in the chunk
-                for c in range(self.ncols):
-                    center = data[lr, c].ravel()
-                    min_d_raw = np.inf
-                    for dr in (-1, 0, 1):
-                        for dc in (-1, 0, 1):
-                            if dr == 0 and dc == 0:
-                                continue
-                            lr2, c2 = lr + dr, c + dc
-                            if lr2 < 0 or lr2 >= data.shape[0] or c2 < 0 or c2 >= self.ncols:
-                                continue
-                            diff = data[lr2, c2].ravel() - center
-                            if ap_flat is not None:
-                                d_raw = float(np.sum(diff * diff * ap_flat))
-                            else:
-                                d_raw = float(np.dot(diff, diff))
-                            if d_raw < min_d_raw:
-                                min_d_raw = d_raw
-                    sigma_sq_map[gr, c] = (min_d_raw / (2.0 * N_p)) if np.isfinite(min_d_raw) else 0.0
-            self.statusBar().showMessage(f"σ² map (CPU): row {chunk_start+chunk_rows}/{n_avail}")
-            QApplication.processEvents()
+        # Live host memory: float32 chunk (4 B/px) + per-thread temporaries of ~2 rows of
+        # float32 (the diff and its square). Cap threads so the temporaries fit too.
+        row_bytes = ncols * npix * 4
+        nthr = int(max(1, min(n_workers(), (0.25 * available_ram()) // (2 * row_bytes))))
+        CHUNK_ROWS = self._host_chunk_rows(4, n_rows_total=max(n_avail, 1))
+        print(f"[SIGMA MAP CPU] CHUNK_ROWS: {CHUNK_ROWS} of {n_avail} rows, {nthr} threads")
+        offsets = [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if (dr, dc) != (0, 0)]
+
+        def row_min_ssd(data, lr):
+            A = data[lr]                                    # (ncols, npix) float32
+            best = np.full(ncols, np.inf, dtype=np.float64)
+            for dr, dc in offsets:
+                lr2 = lr + dr
+                if lr2 < 0 or lr2 >= data.shape[0]:
+                    continue
+                c0, c1 = max(0, -dc), ncols - max(0, dc)    # centre columns whose neighbour exists
+                if c1 <= c0:
+                    continue
+                diff = data[lr2, c0 + dc:c1 + dc] - A[c0:c1]
+                np.multiply(diff, diff, out=diff)
+                if ap_flat is not None:
+                    d = np.einsum('ij,j->i', diff, ap_flat, dtype=np.float64)
+                else:
+                    d = diff.sum(axis=1, dtype=np.float64)
+                np.minimum(best[c0:c1], d, out=best[c0:c1])
+            return best
+
+        with ThreadPoolExecutor(max_workers=nthr) as pool:
+            for chunk_start in range(0, n_avail, CHUNK_ROWS):
+                chunk_rows = min(CHUNK_ROWS, n_avail - chunk_start)
+                read_r0 = max(0, chunk_start - 1)
+                read_r1 = min(n_avail, chunk_start + chunk_rows + 1)
+                data = self._read_rows(self.f_orig, read_r0, read_r1 - read_r0, as_float=True)
+                data = data.reshape(read_r1 - read_r0, ncols, npix)
+                if data.dtype != np.float32:
+                    data = data.astype(np.float32)
+                local_rows = [r + (chunk_start - read_r0) for r in range(chunk_rows)]
+                for r, best in enumerate(pool.map(lambda lr: row_min_ssd(data, lr), local_rows)):
+                    sigma_sq_map[chunk_start + r] = np.where(np.isfinite(best), best / (2.0 * N_p), 0.0)
+                del data
+                self.statusBar().showMessage(f"σ² map (CPU): row {chunk_start+chunk_rows}/{n_avail}")
+                QApplication.processEvents()
         valid_sigmas = sigma_sq_map[sigma_sq_map > 0]
         if len(valid_sigmas) > 0:
             med = float(np.median(valid_sigmas))
@@ -672,6 +818,30 @@ class MainWindow(QMainWindow):
         return sigma_sq_map
 
     # ---- Base pattern retrieval (on-demand) ----
+    def _read_rows(self, fobj, row_start, n_rows, col_start=0, n_cols=None, as_float=False):
+        """Patterns of scan rows [row_start, row_start+n_rows) of `fobj`, optionally only
+        columns [col_start, col_start+n_cols), as an (n, ph, pw) array in scan order.
+        Served from RAM when `fobj` is the original file and it was loaded in memory —
+        as a VIEW, so callers must not write into it — otherwise read from the file with
+        the parallel reader (full rows) or pyebsdindex (column windows).
+        as_float=True returns a fresh float32 copy, like read_data(convertToFloat=True)."""
+        ncols = int(fobj.nCols); ph, pw = int(fobj.patternH), int(fobj.patternW)
+        row_start, n_rows = int(row_start), int(n_rows)
+        if n_cols is None: n_cols = ncols - col_start
+        full = (col_start == 0 and n_cols == ncols)
+        if fobj is self.f_orig and self.patterns is not None:
+            block = self.patterns[row_start * ncols:(row_start + n_rows) * ncols]
+            if not full:
+                block = block.reshape(n_rows, ncols, ph, pw)[:, col_start:col_start + n_cols].reshape(-1, ph, pw)
+        elif full:
+            itemsize = np.dtype(fobj.filedatatype).itemsize
+            block = read_patterns_parallel(fobj.filepath, int(fobj.filePos) + row_start * ncols * ph * pw * itemsize,
+                                           n_rows * ncols, ph, pw, fobj.filedatatype)
+        else:
+            block, _ = fobj.read_data(returnArrayOnly=True, convertToFloat=False,
+                patStartCount=[[col_start, row_start], [n_cols, n_rows]])
+        return block.astype(np.float32) if as_float else block
+
     def _read_pattern(self, fobj, row=None, col=None):
         if row is None: row = self.current_row
         if col is None: col = self.current_col
@@ -680,6 +850,8 @@ class MainWindow(QMainWindow):
         n_avail = getattr(self, 'n_actual_pats', self.nrows * self.ncols)
         if fobj is self.f_orig and pat_idx >= n_avail:
             return np.zeros((int(self.f_orig.patternH), int(self.f_orig.patternW)))
+        if fobj is self.f_orig and self.patterns is not None:
+            return self.patterns[int(pat_idx)].astype(np.float32)
         try:
             pat, _ = fobj.read_data(returnArrayOnly=True, convertToFloat=True,
                 patStartCount=[[col, row], [1, 1]])
@@ -855,39 +1027,16 @@ class MainWindow(QMainWindow):
             if g_ap is not None: del g_ap
             cp.get_default_memory_pool().free_all_blocks()
         else:
-            # CPU fallback: vectorized numpy (still batched, no per-pattern loop)
-            result = chunk.copy()
-
-            if use_static:
-                if self.bg_mode.currentText() == "Subtract":
-                    result -= self.mean_pattern
-                else:
-                    result /= (self.mean_pattern + 1e-10)
-
-            if use_dyn:
-                # scipy gaussian_filter with sigma=(0, s, s) treats first axis as batch
-                from scipy.ndimage import gaussian_filter as sp_gauss
-                result -= sp_gauss(result, sigma=(0, sigma, sigma))
-
-            if global_stretch:
-                if g_hi > g_lo:
-                    result = (result - g_lo) / (g_hi - g_lo)
-                result = (result - 0.5) * (1.0 + cval) + 0.5 + bval
-            elif normalize:
-                flat = result.reshape(N, -1)
-                if ap_bool is not None:
-                    act = ap_bool.reshape(1, -1)
-                    pmin = np.where(act, flat, np.inf).min(axis=1).reshape(N, 1, 1)
-                    pmax = np.where(act, flat, -np.inf).max(axis=1).reshape(N, 1, 1)
-                else:
-                    pmin = flat.min(axis=1).reshape(N, 1, 1)
-                    pmax = flat.max(axis=1).reshape(N, 1, 1)
-                spread = pmax - pmin
-                valid = spread > 0
-                result = np.where(valid, (result - pmin) / np.where(valid, spread, np.ones_like(spread)), result)
-                result = (result - 0.5) * (1.0 + cval) + 0.5 + bval
-            else:
-                result = (result - 127.5) * (1.0 + cval) + 127.5 + bval * 255.0
+            # CPU: run the whole chain (background, stretch, CLAHE, final scale) on
+            # sub-batches across a thread pool; see _cpu_pipeline_threaded.
+            result = self._cpu_pipeline_threaded(chunk, mask_rows,
+                use_static=use_static, bg_subtract=(self.bg_mode.currentText() == "Subtract"),
+                use_dyn=use_dyn, use_clahe=use_clahe, normalize=normalize,
+                global_stretch=global_stretch, unit_domain=unit_domain, sigma=sigma,
+                bval=bval, cval=cval, clip_limit=clip_limit, ap_bool=ap_bool,
+                g_lo=(g_lo if global_stretch else None), g_hi=(g_hi if global_stretch else None))
+            result[~mask_rows] = 0.0
+            return result
 
         # CLAHE stays on CPU (per-pattern, no good batch GPU impl yet).
         # When normalize is on, input is in [0,1] and we apply CLAHE directly.
@@ -924,6 +1073,80 @@ class MainWindow(QMainWindow):
         result[~mask_rows] = 0.0
         return result
 
+    def _cpu_pipeline_subbatch(self, sub, mask_sub, use_static, bg_subtract, use_dyn, use_clahe,
+                               normalize, global_stretch, unit_domain, sigma, bval, cval,
+                               clip_limit, ap_bool, g_lo, g_hi):
+        """CPU processing chain for one sub-batch (n, ph, pw) float64 -> float64 in [0,255].
+        This is the original CPU fallback of _process_chunk_batch plus its CLAHE loop and
+        final scaling, unchanged in the math, split out so several copies can run at once.
+        No Qt widget access in here: everything UI-derived arrives as an argument."""
+        result = sub.copy()
+        n = result.shape[0]
+        if use_static:
+            if bg_subtract:
+                result -= self.mean_pattern
+            else:
+                result /= (self.mean_pattern + 1e-10)
+        if use_dyn:
+            # sigma=(0, s, s): first axis is the batch
+            result -= gaussian_filter(result, sigma=(0, sigma, sigma))
+        if global_stretch:
+            if g_hi > g_lo:
+                result = (result - g_lo) / (g_hi - g_lo)
+            result = (result - 0.5) * (1.0 + cval) + 0.5 + bval
+        elif normalize:
+            flat = result.reshape(n, -1)
+            if ap_bool is not None:
+                act = ap_bool.reshape(1, -1)
+                pmin = np.where(act, flat, np.inf).min(axis=1).reshape(n, 1, 1)
+                pmax = np.where(act, flat, -np.inf).max(axis=1).reshape(n, 1, 1)
+            else:
+                pmin = flat.min(axis=1).reshape(n, 1, 1)
+                pmax = flat.max(axis=1).reshape(n, 1, 1)
+            spread = pmax - pmin
+            valid = spread > 0
+            result = np.where(valid, (result - pmin) / np.where(valid, spread, np.ones_like(spread)), result)
+            result = (result - 0.5) * (1.0 + cval) + 0.5 + bval
+        else:
+            result = (result - 127.5) * (1.0 + cval) + 127.5 + bval * 255.0
+        if use_clahe:
+            for i in range(n):
+                if not mask_sub[i]:
+                    continue
+                if unit_domain:
+                    result[i] = equalize_adapthist(np.clip(result[i], 0, 1), clip_limit=clip_limit)
+                else:
+                    pi = result[i]
+                    src_i = pi[ap_bool] if ap_bool is not None else pi
+                    pmin_i, pmax_i = src_i.min(), src_i.max()
+                    if pmax_i > pmin_i:
+                        p_scaled = np.clip((pi - pmin_i) / (pmax_i - pmin_i), 0, 1)
+                        p_scaled = equalize_adapthist(p_scaled, clip_limit=clip_limit)
+                        result[i] = p_scaled * (pmax_i - pmin_i) + pmin_i
+        if unit_domain:
+            result = np.clip(result * 255.0, 0, 255)
+        else:
+            result = np.clip(result, 0, 255)
+        return result
+
+    def _cpu_pipeline_threaded(self, chunk, mask_rows, **kw):
+        """Split a chunk into ~3 sub-batches per worker thread and run _cpu_pipeline_subbatch
+        on each in a thread pool. scipy.ndimage, the big numpy reductions and most of
+        skimage's CLAHE release the GIL, so this scales across the cores SLURM gave us
+        (n_workers). Output is assembled into one float64 array of the chunk's shape."""
+        N = chunk.shape[0]
+        nthr = max(1, min(n_workers(), N))
+        nsub = max(1, min(N, nthr * 3))
+        bounds = np.linspace(0, N, nsub + 1).astype(int)
+        out = np.empty_like(chunk)
+        def work(k):
+            i0, i1 = int(bounds[k]), int(bounds[k + 1])
+            if i1 > i0:
+                out[i0:i1] = self._cpu_pipeline_subbatch(chunk[i0:i1], mask_rows[i0:i1], **kw)
+        with ThreadPoolExecutor(max_workers=nthr) as pool:
+            list(pool.map(work, range(nsub)))
+        return out
+
     # ---- Display ----
     def on_pattern_clicked(self, row, col):
         self.current_row, self.current_col = row, col
@@ -937,6 +1160,7 @@ class MainWindow(QMainWindow):
         # stretched to fill the colormap by matplotlib's auto-normalize.
         self.raw_canvas.show_pattern(orig, f"Original [{self.current_col}, {self.current_row}]",
                                      vmin=0, vmax=255)
+        if self.current_row >= self.nrows or self.current_col >= self.ncols: return  # stale click from a larger scan
         if self.iq_mask is not None and not self.iq_mask[self.current_row, self.current_col]:
             self.proc_canvas.show_pattern(None, "Excluded by IQ range"); return
         t0 = time.time()
@@ -973,13 +1197,27 @@ class MainWindow(QMainWindow):
         """Load a UP1/UP2 file by path (no dialog). Split out of load_file so the
         loader can be driven headlessly for testing."""
         self.statusBar().showMessage("Loading patterns..."); QApplication.processEvents()
+        # Drop EVERYTHING that belongs to the previous dataset before touching any widget.
+        # The slider resets below emit valueChanged -> _update_iq_range -> update_display,
+        # so anything still pointing at the old scan at that moment (its NLPAR file, its
+        # sigma map, the last clicked row/col, the auto-detect aperture cache) is used
+        # against the new one: wrong shapes, IndexError, and with no excepthook installed
+        # PyQt aborts the whole app on an exception inside a slot. [2026-09-27 review]
+        self.f_nlpar = None; self.nlpar_status.setText("No NLPAR file loaded")
+        self._remove_temp_files()          # previous dataset's NLPAR batch result
+        self.current_row = self.current_col = 0
+        self.iq_map = None; self.iq_mask = None
+        self._invalidate_sigma_map()      # sigma map belongs to the old scan
+        self._invalidate_global_range()   # so do the global-stretch bounds
+        self._lambda_optimized = False    # lambda gate re-arms for the new file
+        self._aperture_cache = None; self._aperture_cache_key = None  # auto-detect mask is per dataset
         self.orig_path = path; self.f_orig = ebsd_pattern.get_pattern_file_obj(path)
         self.nrows, self.ncols = self.f_orig.nRows, self.f_orig.nCols
         ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
         # Check for truncated file but KEEP original header dimensions for OIM compat
         fsize = int(os.path.getsize(path))
         bpp = 2 if path.lower().endswith('.up2') else 1
-        header_bytes = 16 if getattr(self.f_orig, 'version', 1) >= 3 else 0
+        header_bytes = int(getattr(self.f_orig, 'filePos', 42) or 0)  # real data offset (42 for v3, more for v4)
         self.n_actual_pats = int((fsize - header_bytes) // (ph * pw * bpp))
         self.n_actual_rows = self.n_actual_pats // self.ncols
         n_expected = self.nrows * self.ncols
@@ -990,30 +1228,76 @@ class MainWindow(QMainWindow):
         else:
             self.n_actual_rows = self.nrows
             self.n_actual_pats = n_expected
-        # Chunked loading for IQ map and mean pattern (only read rows that exist).
-        # Read in the file's native dtype (uint8/uint16) and cast one chunk at a time:
-        # a 20-row float32 read of a 430x479x479 scan is ~8 GB before we touch it.
-        # Live per pixel: raw read (1–2) + float32 cast (4) + std/square temporaries (~8) ≈ 13.
+        # ---- Tier 1: hold the whole dataset in RAM when it fits (2026-09-27) ----
+        # Native dtype (uint8 = the file size). Threshold 60% of what this process may
+        # still allocate, leaving the rest for the per-pass temporaries the chunk sizing
+        # below draws from the same available_ram(). KPP_IN_MEMORY=1/0 forces it.
+        self.patterns = None                       # release a previous dataset first
+        need = self.n_actual_pats * ph * pw * bpp
+        avail = available_ram()
+        force = os.environ.get('KPP_IN_MEMORY')
+        in_mem = (need <= 0.6 * avail) if force is None else force.strip().lower() not in ('0', 'no', 'false')
+        why = f"{need/1e9:.1f} GB dataset, {avail/1e9:.0f} GB RAM available to this process"
+        if in_mem:
+            print(f"[LOAD] holding the dataset in RAM ({why})")
+            self.patterns = np.empty((self.n_actual_pats, ph, pw), dtype=self.f_orig.filedatatype)
+            t_read = time.time()
+            def prog(done, total):
+                rate = done / max(time.time() - t_read, 1e-9) / 1e6
+                self.statusBar().showMessage(
+                    f"Reading {os.path.basename(path)} into RAM: {done/1e9:.1f}/{total/1e9:.1f} GB ({rate:.0f} MB/s)")
+                QApplication.processEvents()
+            read_patterns_parallel(path, header_bytes, self.n_actual_pats, ph, pw,
+                                   self.f_orig.filedatatype, out=self.patterns, progress=prog, drop_cache=True)
+            t_read = time.time() - t_read
+            print(f"[LOAD] read {need/1e9:.1f} GB in {t_read:.1f}s ({need/1e6/max(t_read,1e-9):.0f} MB/s)")
+            self.mem_mode = "in RAM"
+        else:
+            print(f"[LOAD] streaming from disk on every pass ({why}; needs <= 60% of available, or KPP_IN_MEMORY=1)")
+            self.mem_mode = "streamed from disk"
+        # Chunked statistics for IQ map and mean pattern (only rows that exist).
+        # Native dtype (uint8/uint16), cast one chunk at a time: a 20-row float32 read
+        # of a 430x479x479 scan is ~8 GB before we touch it.
+        # Live per pixel: raw chunk (1–2) + float32 cast (4) + std/square temporaries (~8) ≈ 13.
         CHUNK_ROWS = self._host_chunk_rows(13, n_rows_total=max(self.n_actual_rows, 1))
         print(f"[LOAD] {ph}x{pw} patterns, CHUNK_ROWS: {CHUNK_ROWS} of {self.n_actual_rows} rows")
         iq_values = []
         mean_accum = np.zeros((ph, pw), dtype=np.float64)
         sumsq_accum = np.zeros((ph, pw), dtype=np.float64)  # for per-pixel std (variance-based aperture detection)
         total_pats = 0
-        for row_start in range(0, self.n_actual_rows, CHUNK_ROWS):
-            rows_to_read = min(CHUNK_ROWS, self.n_actual_rows - row_start)
-            chunk, _ = self.f_orig.read_data(returnArrayOnly=True, convertToFloat=False,
-                patStartCount=[[0, row_start], [self.ncols, rows_to_read]])
-            cf = chunk.astype(np.float32)
-            iq_values.append(cf.std(axis=(1, 2)))
-            # Sum in float64: exact from the integer chunk; the squares keep float32
-            # precision (exact for uint8, same rounding as before for uint16).
-            mean_accum += chunk.sum(axis=0, dtype=np.float64)
-            sumsq_accum += np.square(cf).sum(axis=0, dtype=np.float64)
-            total_pats += chunk.shape[0]
-            self.statusBar().showMessage(f"Loading: row {row_start + rows_to_read}/{self.nrows}")
-            QApplication.processEvents()
-            del cf, chunk
+        # Threaded statistics (OSC): each chunk is read once in this thread, then split
+        # into ~nthr slices of patterns that the pool reduces independently. The merge
+        # is exact: the per-pattern std is independent of the split, and both running
+        # sums are float64 over integer-valued terms, so the result is bit-identical to
+        # the old single-threaded loop. Per-slice temporaries are float32 (cast + square),
+        # so cap the threads such that they fit in a quarter of the available RAM.
+        ncols = int(self.ncols)
+        row_bytes_f32 = ncols * ph * pw * 4
+        nthr = int(max(1, min(n_workers(), (0.25 * available_ram()) // (2 * row_bytes_f32))))
+        print(f"[LOAD] {nthr} threads")
+
+        def slice_stats(sl):
+            cf = sl.astype(np.float32)
+            iq = cf.std(axis=(1, 2))
+            s1 = sl.sum(axis=0, dtype=np.float64)
+            s2 = np.square(cf).sum(axis=0, dtype=np.float64)
+            return iq, s1, s2
+
+        with ThreadPoolExecutor(max_workers=nthr) as pool:
+            for row_start in range(0, self.n_actual_rows, CHUNK_ROWS):
+                rows_to_read = min(CHUNK_ROWS, self.n_actual_rows - row_start)
+                chunk = self._read_rows(self.f_orig, row_start, rows_to_read)
+                n = chunk.shape[0]
+                bounds = np.linspace(0, n, min(nthr, n) + 1, dtype=int)
+                slices = [chunk[a:b] for a, b in zip(bounds[:-1], bounds[1:]) if b > a]
+                for iq, s1, s2 in pool.map(slice_stats, slices):
+                    iq_values.append(iq)
+                    mean_accum += s1
+                    sumsq_accum += s2
+                total_pats += n
+                self.statusBar().showMessage(f"Loading: row {row_start + rows_to_read}/{self.nrows}")
+                QApplication.processEvents()
+                del chunk, slices
         # Pad IQ map with zeros for missing rows
         iq_flat = np.concatenate(iq_values)
         if len(iq_flat) < self.nrows * self.ncols:
@@ -1023,14 +1307,11 @@ class MainWindow(QMainWindow):
         # Per-pixel std: sqrt(E[X^2] - E[X]^2). max(.,0) guards against tiny negative values from FP precision.
         mean_sq = sumsq_accum / max(total_pats, 1)
         self.pixel_std = np.sqrt(np.maximum(mean_sq - self.mean_pattern ** 2, 0.0))
-        self.file_label.setText(f"{os.path.basename(path)}\n{self.ncols} x {self.nrows} = {self.ncols*self.nrows} patterns")
+        self.file_label.setText(f"{os.path.basename(path)}\n{self.ncols} x {self.nrows} = {self.ncols*self.nrows} patterns ({self.mem_mode})")
         self.bg_status.setText("Background: all patterns")
         self.scan_canvas.set_map(self.iq_map, self.nrows, self.ncols)
         self.iq_mask = np.ones((self.nrows, self.ncols), dtype=bool)
         self.iq_min_slider.setValue(0); self.iq_max_slider.setValue(1000); self._update_iq_range()
-        self.f_nlpar = None; self.nlpar_status.setText("No NLPAR file loaded")
-        self._invalidate_sigma_map()  # New file → σ² map must be recomputed
-        self._invalidate_global_range()  # New file → global stretch range must be recomputed
         self.on_pattern_clicked(0, 0); self.statusBar().showMessage("Ready")
 
     def load_nlpar_file(self):
@@ -1057,8 +1338,7 @@ class MainWindow(QMainWindow):
         print(f"[BG] CHUNK_ROWS: {CHUNK_ROWS} of {n_avail_rows} rows")
         for row_start in range(0, n_avail_rows, CHUNK_ROWS):
             rows_to_read = min(CHUNK_ROWS, n_avail_rows - row_start)
-            chunk, _ = self.f_orig.read_data(returnArrayOnly=True, convertToFloat=False,
-                patStartCount=[[0, row_start], [self.ncols, rows_to_read]])
+            chunk = self._read_rows(self.f_orig, row_start, rows_to_read)
             mask_flat = mask[row_start:row_start+rows_to_read, :].flatten()
             if mask_flat.any(): mean_accum += chunk[mask_flat].sum(axis=0, dtype=np.float64)
             del chunk
@@ -1078,9 +1358,8 @@ class MainWindow(QMainWindow):
         min(32 GB, total_RAM/4), which on a 33.7 GB machine asks for an 8.4 GB tile and
         dies with _ArrayMemoryError on a 479x479 scan. Track AVAILABLE RAM instead so a
         busy machine simply tiles smaller."""
-        if HAS_PSUTIL:
-            return int(min(4.0e9, 0.25 * psutil.virtual_memory().available))
-        return int(2.0e9)  # no psutil -> conservative fixed budget
+        # 16 GB cap (was 4): bigger numba tiles amortize better across many cores.
+        return int(min(16.0e9, 0.25 * available_ram()))
 
     def optimize_lambda(self):
         """Estimate the NLPAR lambda straight off self.orig_path — no temp copy at all.
@@ -1130,6 +1409,7 @@ class MainWindow(QMainWindow):
                 f"Optimizing lambda (aperture={ap_label}, N_p={N_p})..."); QApplication.processEvents()
             nlobj.opt_lambda(chunksize=budget, automask=False, autoupdate=True, backsub=False)
             self.lam_spin.setValue(float(nlobj.lam))
+            self._lambda_optimized = True
             print(f"[OPT LAMBDA] lambda = {float(nlobj.lam):.4f}  (N_p = {N_p})")
             self.statusBar().showMessage(f"Optimal lambda: {float(nlobj.lam):.3f} (N_p={N_p})")
         except Exception as e:
@@ -1140,6 +1420,12 @@ class MainWindow(QMainWindow):
     def apply_nlpar_batch(self):
         """Run NLPAR on the full dataset. Uses GPU shift-and-compare when available, else pyebsdindex CPU."""
         if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1 file first"); return
+        if not self._lambda_optimized:
+            QMessageBox.information(self, "Optimize lambda first",
+                "Need to optimize lambda before applying NLPAR to the full dataset.\n\n"
+                "Click 'Optimize Lambda', wait for it to finish, then click "
+                "'Apply NLPAR to Full Dataset' again.")
+            return
         sr, lam = self.sr_spin.value(), self.lam_spin.value()
 
         if HAS_GPU:
@@ -1219,8 +1505,7 @@ class MainWindow(QMainWindow):
             mask_r1 = min(self.nrows, chunk_start + chunk_rows + sr)
 
             if read_r1 > read_r0:
-                data_np, _ = self.f_orig.read_data(returnArrayOnly=True, convertToFloat=True,
-                    patStartCount=[[0, read_r0], [self.ncols, read_r1 - read_r0]])
+                data_np = self._read_rows(self.f_orig, read_r0, read_r1 - read_r0, as_float=True)
                 # copy=False: read_data already returned float32, don't duplicate the block.
                 data_np = data_np.reshape(read_r1 - read_r0, self.ncols, ph, pw).astype(np.float32, copy=False)
             else:
@@ -1409,9 +1694,16 @@ class MainWindow(QMainWindow):
     def apply_and_save(self):
         """Save all processed patterns to a new UP1 file (chunked)."""
         if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1 file first"); return
+        if self.nlpar_chk.isChecked() and self.f_nlpar is None:
+            QMessageBox.information(self, "NLPAR not applied to full dataset",
+                "Need to apply NLPAR to the full dataset before saving.\n\n"
+                "Click 'Apply NLPAR to Full Dataset', wait for it to finish, then "
+                "click 'Apply && Save' again.")
+            return
         path, _ = QFileDialog.getSaveFileName(self, "Save Processed Patterns",
             os.path.dirname(self.orig_path), "UP1 Files (*.up1)")
         if not path: return
+        path = os.path.abspath(path)
         self.statusBar().showMessage(f"Processing all patterns ({'GPU' if HAS_GPU else 'CPU'})..."); QApplication.processEvents()
         t0 = time.time()
         mask = self._get_iq_mask()
@@ -1448,15 +1740,13 @@ class MainWindow(QMainWindow):
                 chunk = np.zeros((rows_to_read * self.ncols, ph, pw), dtype=read_dtype)
             elif row_start + rows_to_read > n_avail_rows:
                 real_rows = n_avail_rows - row_start
-                real_chunk, _ = src_fobj.read_data(returnArrayOnly=True, convertToFloat=False,
-                    patStartCount=[[0, row_start], [self.ncols, real_rows]])
+                real_chunk = self._read_rows(src_fobj, row_start, real_rows)
                 pad_count = (rows_to_read - real_rows) * self.ncols
                 pad = np.zeros((pad_count, ph, pw), dtype=real_chunk.dtype)
                 chunk = np.concatenate([real_chunk, pad], axis=0)
                 del real_chunk, pad
             else:
-                chunk, _ = src_fobj.read_data(returnArrayOnly=True, convertToFloat=False,
-                    patStartCount=[[0, row_start], [self.ncols, rows_to_read]])
+                chunk = self._read_rows(src_fobj, row_start, rows_to_read)
             mask_rows = mask[row_start:row_start+rows_to_read, :].flatten()
             # Batch process entire chunk (GPU-accelerated if available); it expects float64.
             chunk = self._process_chunk_batch(chunk.astype(np.float64), mask_rows)
@@ -1490,8 +1780,7 @@ class MainWindow(QMainWindow):
         n_total = self.nrows * self.ncols
         self.statusBar().showMessage(f"Saved to {os.path.basename(path)} ({elapsed:.1f}s)")
         QMessageBox.information(self, "Saved",
-            f"Processed patterns saved to:\n{path}\n\n"
-            f"Source: {src_label}\nMode: {'GPU' if HAS_GPU else 'CPU'}\nPatterns: {n_saved}/{n_total}\nTime: {elapsed:.1f}s")
+            f"Processed patterns saved to:\n{path}\n\nSource: {src_label}\nMode: {'GPU' if HAS_GPU else 'CPU'}\nPatterns: {n_saved}/{n_total}\nTime: {elapsed:.1f}s")
 
     def _update_iq_range(self):
         if self.iq_map is None: return

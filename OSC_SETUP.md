@@ -33,8 +33,8 @@ feature list. This file covers only what changes when you leave Windows.
 Not needed: `gpu_pattern_viewer.bat`, `__pycache__/`, `.vscode/`,
 `test_kikuchipy.py` (empty).
 
-Data files (`.up1`) are 0.7 to 8 GB each. Move them with Globus or `sftp` to
-`/fs/scratch/<project>/...`, not through the chat.
+Data files (`.up1`) are 0.7 to 32 GB each. Move them with Globus or `sftp`
+(home is fine; scratch is not required), not through the chat.
 
 ## Dev machine environment (what it is known to work with)
 
@@ -127,8 +127,7 @@ on clean exit:
 - `_cpu_nlpar_result.up1`
 - pyebsdindex fallback name `<stem>_NLPAR_l<lam>sr<sr>.up1`
 
-Keep inputs on scratch so these land on scratch too, and clean up manually if
-the session is killed.
+They land next to the input; clean up manually if the session is killed.
 
 ## Things that were only ever tested on Windows and might bite
 
