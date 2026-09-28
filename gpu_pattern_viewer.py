@@ -1,3 +1,4 @@
+__version__ = "1.1.0"   # shown in the window title; bump with each release (git tag v<version>)
 import sys
 import os
 import glob
@@ -242,7 +243,7 @@ class PatternCanvas(FigureCanvas):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("EBSD Pattern Processor (GPU Accelerated)" if HAS_GPU else f"EBSD Pattern Processor (CPU Mode, {n_workers()} threads)"); self.setGeometry(100, 100, 1400, 900)
+        self.setWindowTitle(f"Kikuchi Pattern Processor v{__version__} " + ("(GPU Accelerated)" if HAS_GPU else f"(CPU Mode, {n_workers()} threads)")); self.setGeometry(100, 100, 1400, 900)
         self.orig_path = None; self.f_orig = self.f_nlpar = None
         # Tier 1 (2026-09-27): the raw dataset held in RAM as one (npat, ph, pw) array in
         # the file's native dtype, when it fits. Every whole-dataset pass then slices this
