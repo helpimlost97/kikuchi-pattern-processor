@@ -818,6 +818,18 @@ class MainWindow(QMainWindow):
         return sigma_sq_map
 
     # ---- Base pattern retrieval (on-demand) ----
+    def _read_patterns(self, fobj, p0, n):
+        """Patterns [p0, p0+n) of `fobj` in file order, regardless of row boundaries
+        (used for the partial last row of a map that was stopped early). RAM view when
+        `fobj` is the in-memory original, else the parallel reader."""
+        ph, pw = int(fobj.patternH), int(fobj.patternW)
+        p0, n = int(p0), int(n)
+        if fobj is self.f_orig and self.patterns is not None:
+            return self.patterns[p0:p0 + n]
+        itemsize = np.dtype(fobj.filedatatype).itemsize
+        return read_patterns_parallel(fobj.filepath, int(fobj.filePos) + p0 * ph * pw * itemsize,
+                                      n, ph, pw, fobj.filedatatype)
+
     def _read_rows(self, fobj, row_start, n_rows, col_start=0, n_cols=None, as_float=False):
         """Patterns of scan rows [row_start, row_start+n_rows) of `fobj`, optionally only
         columns [col_start, col_start+n_cols), as an (n, ph, pw) array in scan order.
@@ -1471,15 +1483,17 @@ class MainWindow(QMainWindow):
         # Output file setup
         tmp_dir = os.path.dirname(self.orig_path)
         out_path = os.path.join(tmp_dir, "_gpu_nlpar_result.up1")
+        # Create the file ourselves: source header verbatim + sparse truncate to the
+        # number of patterns the source actually has. Letting pyebsdindex create it
+        # pre-fills every pattern with zeros one tofile() at a time (see apply_and_save).
+        hdr_len = int(self.f_orig.filePos)
+        with open(self.orig_path, 'rb') as f_src:
+            hdr = f_src.read(hdr_len)
+        with open(out_path, 'wb') as f_dst:
+            f_dst.write(hdr)
+            f_dst.truncate(hdr_len + int(getattr(self, 'n_actual_pats', self.nrows * self.ncols)) * ph * pw
+                           * (2 if self.orig_path.lower().endswith('.up2') else 1))
         out_obj = ebsd_pattern.get_pattern_file_obj(out_path)
-        out_obj.patternW = pw; out_obj.patternH = ph
-        out_obj.nCols = self.ncols; out_obj.nRows = self.nrows
-        out_obj.nPatterns = self.ncols * self.nrows
-        out_obj.xStep = self.f_orig.xStep; out_obj.yStep = self.f_orig.yStep
-        out_obj.hexflag = self.f_orig.hexflag
-        out_obj.extraPatterns = self.f_orig.extraPatterns
-        out_obj.version = self.f_orig.version
-        out_obj.filePos = self.f_orig.filePos
 
         # Adaptive chunk size based on VRAM and pattern dimensions
         pat_bytes = ph * pw * 4  # float32
@@ -1493,7 +1507,6 @@ class MainWindow(QMainWindow):
         # not the same as fitting RAM.
         CHUNK_ROWS = min(CHUNK_ROWS, self._host_chunk_rows(12))
         print(f"[GPU NLPAR] Pattern: {ph}x{pw}, VRAM budget: {vram_budget/1e9:.1f} GB, CHUNK_ROWS: {CHUNK_ROWS}")
-        first_write = True
 
         for chunk_start in range(0, self.nrows, CHUNK_ROWS):
             chunk_rows = min(CHUNK_ROWS, self.nrows - chunk_start)
@@ -1596,18 +1609,7 @@ class MainWindow(QMainWindow):
             result_np[~mask_chunk] = 0.0
 
             # Write to output
-            if first_write:
-                out_obj.write_data(newpatterns=result_np, patStartCount=[0, -1], writeHead=True)
-                if self.f_orig.filePos > 42:
-                    with open(self.orig_path, 'rb') as f_src:
-                        f_src.seek(42)
-                        extra_hdr = f_src.read(self.f_orig.filePos - 42)
-                    with open(out_path, 'r+b') as f_dst:
-                        f_dst.seek(42)
-                        f_dst.write(extra_hdr)
-                first_write = False
-            else:
-                out_obj.write_data(newpatterns=result_np, patStartCount=[chunk_start * self.ncols, -1], writeHead=False)
+            out_obj.write_data(newpatterns=result_np, patStartCount=[chunk_start * self.ncols, -1], writeHead=False)
             del result_np
 
             elapsed_so_far = time.time() - t0
@@ -1727,57 +1729,63 @@ class MainWindow(QMainWindow):
         # (1–2 B/px) + the float64 cast the batch function needs (8) + the float64 result (8)
         # + write-side uint8/uint16 conversion (~1) ≈ 18. Cap by whichever is tighter.
         CHUNK_ROWS = min(CHUNK_ROWS, self._host_chunk_rows(18))
-        print(f"[SAVE] CHUNK_ROWS: {CHUNK_ROWS} of {self.nrows} rows")
-        n_avail_rows = getattr(self, 'n_actual_rows', self.nrows)
-        first_chunk = True; out_obj = None; n_saved = 0
-        for row_start in range(0, self.nrows, CHUNK_ROWS):
-            rows_to_read = min(CHUNK_ROWS, self.nrows - row_start)
-            # Read real data or generate zeros for missing rows. Read in the file's native
-            # dtype and pad in the SAME dtype so the concatenate doesn't silently produce a
-            # float64 block before we even start; the float64 cast happens once, below.
-            read_dtype = getattr(src_fobj, 'filedatatype', np.uint8)
-            if row_start >= n_avail_rows:
-                chunk = np.zeros((rows_to_read * self.ncols, ph, pw), dtype=read_dtype)
-            elif row_start + rows_to_read > n_avail_rows:
-                real_rows = n_avail_rows - row_start
-                real_chunk = self._read_rows(src_fobj, row_start, real_rows)
-                pad_count = (rows_to_read - real_rows) * self.ncols
-                pad = np.zeros((pad_count, ph, pw), dtype=real_chunk.dtype)
-                chunk = np.concatenate([real_chunk, pad], axis=0)
-                del real_chunk, pad
-            else:
+        # ---- Output size: exactly the patterns the source has (2026-09-28) ----
+        # A map that was stopped early has fewer patterns in the .up1 than nCols*nRows
+        # in its header (OIM writes it that way). The header keeps the full grid so OIM
+        # still lines the file up with its scan, but we write only the patterns that
+        # exist -- full rows plus the trailing partial row -- instead of fabricating,
+        # processing and writing zero patterns for every missing row (a third of the
+        # work and 16 GB on a 2131x1671 scan stopped at row 1097).
+        n_out = int(getattr(self, 'n_actual_pats', self.nrows * self.ncols))
+        ncols = int(self.ncols)
+        n_rows_out = (n_out + ncols - 1) // ncols            # includes a partial last row
+        n_full_rows = int(getattr(self, 'n_actual_rows', self.nrows))
+        print(f"[SAVE] CHUNK_ROWS: {CHUNK_ROWS} of {n_rows_out} rows ({n_out} patterns"
+              f"{'' if n_out == self.nrows * ncols else f', header grid {ncols}x{self.nrows}'})")
+        # ---- Create the file ourselves (2026-09-28) ----
+        # pyebsdindex.write_data() on a path that does not exist yet pre-fills the whole
+        # file with blank patterns, one 13 KB tofile() per pattern: 3.56 M writes over NFS
+        # at ~28 MB/s, i.e. ~28 min of zeros before the first real chunk lands (Ni: ~19 min).
+        # Copy the source header verbatim (same grid, version, steps, v4 extra bytes) and
+        # reserve the final size with a sparse truncate (milliseconds); the chunk writes
+        # below then fill it in place.
+        ph_bytes = ph * pw * (2 if self.orig_path.lower().endswith('.up2') else 1)
+        hdr_len = int(self.f_orig.filePos)
+        with open(self.orig_path, 'rb') as f_src:
+            hdr = f_src.read(hdr_len)
+        with open(path, 'wb') as f_dst:
+            f_dst.write(hdr)
+            f_dst.truncate(hdr_len + n_out * ph_bytes)
+        out_obj = ebsd_pattern.get_pattern_file_obj(path)   # reads the header we just wrote
+        mask_flat = mask.reshape(-1)
+        n_saved = 0
+        for row_start in range(0, n_rows_out, CHUNK_ROWS):
+            rows_to_read = min(CHUNK_ROWS, n_rows_out - row_start)
+            p0 = row_start * ncols
+            p1 = min((row_start + rows_to_read) * ncols, n_out)
+            if p1 <= n_full_rows * ncols:
                 chunk = self._read_rows(src_fobj, row_start, rows_to_read)
-            mask_rows = mask[row_start:row_start+rows_to_read, :].flatten()
+            else:
+                # Chunk ends in the partial row. Full rows come from the processing source;
+                # the partial row's patterns come from the original file (the NLPAR batch
+                # result has zeros there because pyebsdindex only processed whole rows).
+                parts = []
+                if p0 < n_full_rows * ncols:
+                    parts.append(self._read_rows(src_fobj, row_start, n_full_rows - row_start))
+                q0 = max(p0, n_full_rows * ncols)
+                parts.append(self._read_patterns(self.f_orig, q0, p1 - q0))
+                chunk = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
+                del parts
+            mask_rows = mask_flat[p0:p1]
             # Batch process entire chunk (GPU-accelerated if available); it expects float64.
             chunk = self._process_chunk_batch(chunk.astype(np.float64), mask_rows)
             n_saved += int(mask_rows.sum())
-            # Write chunk
-            if first_chunk:
-                out_obj = ebsd_pattern.get_pattern_file_obj(path)
-                out_obj.patternW = pw; out_obj.patternH = ph
-                out_obj.nCols = self.ncols; out_obj.nRows = self.nrows
-                out_obj.nPatterns = self.ncols * self.nrows
-                out_obj.xStep = self.f_orig.xStep; out_obj.yStep = self.f_orig.yStep
-                out_obj.hexflag = self.f_orig.hexflag
-                out_obj.extraPatterns = self.f_orig.extraPatterns; out_obj.version = self.f_orig.version
-                out_obj.filePos = self.f_orig.filePos
-                out_obj.write_data(newpatterns=chunk, patStartCount=[0, -1], writeHead=True)
-                # Copy extra header bytes (v4+ has 16 bytes between standard 42-byte header and filePos)
-                if self.f_orig.filePos > 42:
-                    with open(self.orig_path, 'rb') as f_src:
-                        f_src.seek(42)
-                        extra_hdr = f_src.read(self.f_orig.filePos - 42)
-                    with open(path, 'r+b') as f_dst:
-                        f_dst.seek(42)
-                        f_dst.write(extra_hdr)
-                first_chunk = False
-            else:
-                out_obj.write_data(newpatterns=chunk, patStartCount=[row_start * self.ncols, -1], writeHead=False)
+            out_obj.write_data(newpatterns=chunk, patStartCount=[p0, -1], writeHead=False)
             del chunk
-            self.statusBar().showMessage(f"Saving: row {row_start + rows_to_read}/{self.nrows}")
+            self.statusBar().showMessage(f"Saving: row {row_start + rows_to_read}/{n_rows_out}")
             QApplication.processEvents()
         elapsed = time.time() - t0
-        n_total = self.nrows * self.ncols
+        n_total = n_out
         self.statusBar().showMessage(f"Saved to {os.path.basename(path)} ({elapsed:.1f}s)")
         QMessageBox.information(self, "Saved",
             f"Processed patterns saved to:\n{path}\n\nSource: {src_label}\nMode: {'GPU' if HAS_GPU else 'CPU'}\nPatterns: {n_saved}/{n_total}\nTime: {elapsed:.1f}s")

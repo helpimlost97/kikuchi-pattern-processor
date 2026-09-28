@@ -102,6 +102,31 @@ activate if CuPy is installed on a GPU node.
     their state across loads, so a new file with preview NLPAR on immediately
     computes its full sigma map as part of the first display.
 
+12. **Apply && Save: no more blank pre-fill; maps stopped early** (2026-09-28,
+    found on the DDC `MB6-103` scan, 2131x1671 header, 2,338,772 patterns in the
+    file). Two things:
+    (a) `pyebsdindex.write_data()` on a path that does not exist yet calls
+    `write_header(writeBlank=True)`, which writes one blank pattern per
+    `tofile()` for every nCols*nRows pattern: 3.56 M 13 KB writes over NFS,
+    measured 28 MB/s on home = ~28 min of zeros before the first real chunk
+    (the Ni scan paid ~19 min the same way). Max killed that save at 42 GB;
+    the file was all zeros. Now `apply_and_save` (and the GPU NLPAR writer)
+    copy the source header verbatim and `truncate()` to the final size (sparse,
+    6 ms), then write chunks with `writeHead=False`.
+    (b) The save looped over all header rows, fabricating zero patterns for the
+    574 missing rows, running them through the pipeline and writing them (16 GB
+    here), and it dropped the 1065 patterns of the trailing partial row. It now
+    writes exactly `n_actual_pats` patterns (full rows + partial row, header
+    keeps the full grid, i.e. the same shape OIM wrote). The partial row is
+    taken from the ORIGINAL file even when the NLPAR result is the source,
+    because pyebsdindex only processes whole rows (its result has zeros there).
+    New helper `_read_patterns(fobj, p0, n)` reads a pattern range across row
+    boundaries (RAM view or parallel reader).
+    Verified headless on the 20-row subset (scratchpad test, 8 threads): a
+    12-row + 200-pattern truncated copy saves 5360 patterns, header byte-equal
+    to the source, and the data is byte-equal to the first 5360 patterns of the
+    full-file save. Full 20-row save 34.7 s vs ~60-75 s before (the pre-fill).
+
 Measured on the login node (8 threads), full Ni scan 32.4 GB from HOME:
 - read into RAM: 34.2 s cold (945 MB/s), 14.9 s partly cached
 - load statistics (IQ / mean / pixel std) after the read: 46 s at 8 threads
