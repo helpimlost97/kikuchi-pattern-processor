@@ -1,4 +1,4 @@
-__version__ = "1.2.0"   # shown in the window title; bump with each release (git tag v<version>)
+__version__ = "1.3.0"   # shown in the window title; bump with each release (git tag v<version>)
 import sys
 import os
 import glob
@@ -281,11 +281,33 @@ class RamUPFile(ebsd_pattern.UPFile):
             if nc < 0: nc = ncols - c0
             if nr < 0: nr = nrows - r0
             nc = min(nc, ncols - c0); nr = min(nr, nrows - r0)
-            grid = self._ram[:nrows * ncols].reshape(nrows, ncols, ph, pw)   # view
-            pats = grid[r0:r0 + nr, c0:c0 + nc].reshape(nr * nc, ph, pw).astype(typeout)
+            n_ram = self._ram.shape[0]
+            full_rows = n_ram // ncols          # a map stopped early has fewer rows than the header
+            if r0 + nr <= full_rows:
+                grid = self._ram[:full_rows * ncols].reshape(full_rows, ncols, ph, pw)   # view
+                pats = grid[r0:r0 + nr, c0:c0 + nc].reshape(nr * nc, ph, pw).astype(typeout)
+            else:                            # touches the partial row / missing rows: zeros there
+                pats = np.zeros((nr * nc, ph, pw), dtype=typeout)
+                for i in range(nr):
+                    p0 = (r0 + i) * ncols + c0; p1 = min(p0 + nc, n_ram)
+                    if p1 > p0: pats[i * nc:i * nc + (p1 - p0)] = self._ram[p0:p1]
             idx = (np.arange(r0, r0 + nr, dtype=np.int64)[:, None] * ncols
                    + np.arange(c0, c0 + nc, dtype=np.int64)[None, :]).ravel()
         return pats, self._xyloc(idx)
+
+
+class RamOutUPFile(RamUPFile):
+    """Output-side twin: pyebsdindex's NLPAR writes its result through
+    getoutfileobj().write_data() -> pat_writer(); here the patterns land in the RAM
+    array instead of a file. The int conversion (pat_flt2int, 'clip') still happens
+    in write_data, so the values are exactly what the file would have held. The
+    file on disk (self.filepath = the input) is never touched."""
+    def pat_writer(self, pat2write, patStart, nPatToWrite, typewrite):
+        p0, n = int(patStart), int(nPatToWrite)
+        n = min(n, self._ram.shape[0] - p0)
+        if n > 0: self._ram[p0:p0 + n] = pat2write[:n].astype(self._ram.dtype, copy=False)
+    def write_header(self, *a, **k): return 0
+    def write_datamaxmin(self): pass
 
 
 class MainWindow(QMainWindow):
@@ -293,6 +315,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"Kikuchi Pattern Processor v{__version__} " + ("(GPU Accelerated)" if HAS_GPU else f"(CPU Mode, {n_workers()} threads)")); self.setGeometry(100, 100, 1400, 900)
         self.orig_path = None; self.f_orig = self.f_nlpar = None
+        self.nlpar_patterns = None        # in-RAM NLPAR batch result (v1.3.0)
         # Tier 1 (2026-09-27): the raw dataset held in RAM as one (npat, ph, pw) array in
         # the file's native dtype, when it fits. Every whole-dataset pass then slices this
         # instead of re-streaming the file (each pass was a full 32 GB read from home NFS).
@@ -884,14 +907,45 @@ class MainWindow(QMainWindow):
         nlobj.getinfileobj = infile
         return True
 
+    def _nlpar_result_to_ram(self, nlobj):
+        """Point a pyebsdindex NLPAR object's OUTPUT at a second in-RAM array
+        (self.nlpar_patterns) instead of _cpu_nlpar_result.up1 (Max, 2026-09-28: only
+        Apply && Save should write to disk). Needs the original in RAM and room for a
+        second copy (same 60%-of-available rule as the load); otherwise returns False
+        and the caller writes the temp file as before. KPP_NLPAR_IN_MEMORY=0 forces
+        the file."""
+        if self.patterns is None:
+            return False
+        if os.environ.get('KPP_NLPAR_IN_MEMORY', '').strip().lower() in ('0', 'no', 'false'):
+            return False
+        self.nlpar_patterns = None           # free a previous result first
+        need = self.patterns.nbytes; avail = available_ram()
+        if need > 0.6 * avail:
+            print(f"[CPU NLPAR] result goes to disk: a second {need/1e9:.1f} GB copy does not fit "
+                  f"({avail/1e9:.0f} GB available to this process)")
+            return False
+        self.nlpar_patterns = np.empty_like(self.patterns)
+        n_full = int(getattr(self, 'n_actual_rows', self.nrows)) * int(self.ncols)
+        if n_full < self.nlpar_patterns.shape[0]:      # partial last row: pyebsdindex does whole rows only
+            self.nlpar_patterns[n_full:] = self.patterns[n_full:]
+        out = RamOutUPFile(self.orig_path, self.nlpar_patterns)
+        def outfile():
+            if nlobj.nrows is not None: out.nRows = nlobj.nrows
+            if nlobj.ncols is not None: out.nCols = nlobj.ncols
+            return out
+        nlobj.setoutfile = lambda patternfile, filepath=None: None   # no temp file on disk
+        nlobj.getoutfileobj = outfile
+        return True
+
     def _read_patterns(self, fobj, p0, n):
         """Patterns [p0, p0+n) of `fobj` in file order, regardless of row boundaries
         (used for the partial last row of a map that was stopped early). RAM view when
         `fobj` is the in-memory original, else the parallel reader."""
         ph, pw = int(fobj.patternH), int(fobj.patternW)
         p0, n = int(p0), int(n)
-        if fobj is self.f_orig and self.patterns is not None:
-            return self.patterns[p0:p0 + n]
+        ram = self.patterns if fobj is self.f_orig else getattr(fobj, '_ram', None)
+        if ram is not None:
+            return ram[p0:p0 + n]
         itemsize = np.dtype(fobj.filedatatype).itemsize
         return read_patterns_parallel(fobj.filepath, int(fobj.filePos) + p0 * ph * pw * itemsize,
                                       n, ph, pw, fobj.filedatatype)
@@ -907,8 +961,9 @@ class MainWindow(QMainWindow):
         row_start, n_rows = int(row_start), int(n_rows)
         if n_cols is None: n_cols = ncols - col_start
         full = (col_start == 0 and n_cols == ncols)
-        if fobj is self.f_orig and self.patterns is not None:
-            block = self.patterns[row_start * ncols:(row_start + n_rows) * ncols]
+        ram = self.patterns if fobj is self.f_orig else getattr(fobj, '_ram', None)
+        if ram is not None:                  # in-RAM original, or the in-RAM NLPAR result
+            block = ram[row_start * ncols:(row_start + n_rows) * ncols]
             if not full:
                 block = block.reshape(n_rows, ncols, ph, pw)[:, col_start:col_start + n_cols].reshape(-1, ph, pw)
         elif full:
@@ -1281,7 +1336,7 @@ class MainWindow(QMainWindow):
         # sigma map, the last clicked row/col, the auto-detect aperture cache) is used
         # against the new one: wrong shapes, IndexError, and with no excepthook installed
         # PyQt aborts the whole app on an exception inside a slot. [2026-09-27 review]
-        self.f_nlpar = None; self.nlpar_status.setText("No NLPAR file loaded")
+        self.f_nlpar = None; self.nlpar_patterns = None; self.nlpar_status.setText("No NLPAR file loaded")
         self._remove_temp_files()          # previous dataset's NLPAR batch result
         self.current_row = self.current_col = 0
         self.iq_map = None; self.iq_mask = None
@@ -1396,6 +1451,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Open NLPAR UP1 File",
             "", "UP1 Files (*.up1 *.up2)")
         if not path: return
+        self.nlpar_patterns = None       # a file replaces any in-RAM result
         self.f_nlpar = ebsd_pattern.get_pattern_file_obj(path)
         self.nlpar_chk.setChecked(False)  # disable on-demand since we have a file
         self.nlpar_status.setText(f"Loaded: {os.path.basename(path)}"); self.update_display()
@@ -1727,6 +1783,7 @@ class MainWindow(QMainWindow):
             if n_avail < self.nrows:
                 nlobj.nrows = int(n_avail)
             from_ram = self._serve_nlpar_from_ram(nlobj)
+            to_ram = self._nlpar_result_to_ram(nlobj)
             ap = self._current_aperture()
             if ap is not None:
                 nlobj.mask = (ap > 0).astype(np.uint8)
@@ -1740,7 +1797,16 @@ class MainWindow(QMainWindow):
             print(f"[CPU NLPAR] SR={sr} lam={lam:.3f} aperture={ap_label} "
                   f"N_p={N_p}/{ph*pw} ({100.0*N_p/(ph*pw):.1f}%) "
                   f"rows={int(n_avail)}/{self.nrows} chunk_budget={budget/1e9:.2f} GB "
-                  f"source={'RAM' if from_ram else 'file'} -> {out_path}")
+                  f"source={'RAM' if from_ram else 'file'} -> {'RAM' if to_ram else out_path}")
+            if to_ram:
+                nlobj.calcnlpar(chunksize=budget, saturation_protect=True, automask=False, backsub=False)
+                elapsed = time.time() - t0
+                self.f_nlpar = RamUPFile(self.orig_path, self.nlpar_patterns)
+                self.nlpar_chk.setChecked(False)
+                self.nlpar_status.setText(f"NLPAR in RAM: SR={sr}, lam={lam:.2f} ({elapsed:.1f}s)")
+                self.statusBar().showMessage(f"NLPAR batch complete in RAM ({elapsed:.1f}s, N_p={N_p})")
+                self.update_display()
+                return
             result_path = nlobj.calcnlpar(chunksize=budget, saturation_protect=True,
                                           automask=False, backsub=False, fileout=out_path)
             elapsed = time.time() - t0

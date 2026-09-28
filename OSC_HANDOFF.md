@@ -143,6 +143,25 @@ activate if CuPy is installed on a GPU node.
     Verified on the 20-row subset: lambda and the NLPAR output md5 identical
     for the file path and the RAM path.
 
+14. **NLPAR batch result kept in RAM** (2026-09-28, Max: "apply nlpar should
+    just write a second dataset to ram, not to the disk. Then Apply and save
+    should be the only thing writing things to the disk"). `RamOutUPFile`
+    (subclass of `RamUPFile`) overrides `pat_writer` to store into
+    `self.nlpar_patterns` (np.empty_like(self.patterns); the partial last row
+    is copied from the original since pyebsdindex only processes whole rows),
+    `write_header`/`write_datamaxmin` are no-ops. `_nlpar_result_to_ram(nlobj)`
+    allocates it (60 %-of-available rule, `KPP_NLPAR_IN_MEMORY=0` forces the
+    file), binds `nlobj.getoutfileobj` to it and makes `nlobj.setoutfile` a
+    no-op so no `_cpu_nlpar_result.up1` is created. `self.f_nlpar` becomes a
+    `RamUPFile` over that array; `_read_rows`/`_read_patterns` now serve any
+    object with a `_ram` attribute, `_read_pattern` goes through its
+    `read_data` (slab form handles a partial row). Cleared on load, on
+    "Load Existing NLPAR UP1", and before a new batch. Console:
+    `source=RAM -> RAM`. Verified on the 20-row subset: RAM result byte-equal to
+    the temp-file result, Apply && Save outputs md5-identical, no temp file,
+    display read equal to the array. README 4.3 table has a new column for
+    the memory this needs (two dataset-sized arrays).
+
 Measured on the login node (8 threads), full Ni scan 32.4 GB from HOME:
 - read into RAM: 34.2 s cold (945 MB/s), 14.9 s partly cached
 - load statistics (IQ / mean / pixel std) after the read: 46 s at 8 threads
@@ -190,9 +209,12 @@ next to the input. Scratch is only used for the test subset.
 
 ## Open items / decisions Max has NOT made yet
 
-- Whether to commit the changes (nothing committed; author attribution TBD).
-- Whether to run the 72-core timing job.
-- Whether to update `OSC_SETUP.md`/`README.md` to reflect the above.
+- Commits: v1.0.0 (OSC port), v1.1.0 (save fixes), v1.2.0 (NLPAR reads from
+  RAM), v1.3.0 (NLPAR result in RAM) are committed and tagged locally; pushing
+  needs Max's GitHub credentials (`git push && git push --tags`).
+- Whether to run the 72-96-core timing job.
+- Still open: NPAR not applied on Apply && Save; preview checkboxes survive a
+  new load; headless CLI; scratch re-stream tier 2 (parked, "no scratch").
 - GPU: not installed. If wanted later: a Cardinal GPU desktop +
   `pip install cupy-cuda12x` into the venv; code needs no change.
 - Headless CLI for Apply&&Save (mentioned in OSC_SETUP.md) — not written.
