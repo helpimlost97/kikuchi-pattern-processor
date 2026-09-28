@@ -1,4 +1,4 @@
-__version__ = "1.3.0"   # shown in the window title; bump with each release (git tag v<version>)
+__version__ = "1.4.0"   # shown in the window title; bump with each release (git tag v<version>)
 import sys
 import os
 import glob
@@ -48,16 +48,35 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 # GPU acceleration via CuPy (falls back to CPU if unavailable)
+# CuPy importing is not enough: on a login node / CPU-only compute node the wheel imports
+# fine but there is no driver or device, and the first kernel launch would fail deep
+# inside a pass. So HAS_GPU also requires a visible device, and KPP_GPU=0 forces CPU.
+_gpu_why = None
 try:
     import cupy as cp
     import cupyx.scipy.ndimage as cp_ndimage
-    HAS_GPU = True
-    _gpu_name = cp.cuda.runtime.getDeviceProperties(0)['name']
-    if isinstance(_gpu_name, bytes): _gpu_name = _gpu_name.decode()
-    print(f"[GPU] CuPy detected: {_gpu_name}")
+    try:
+        HAS_GPU = cp.cuda.runtime.getDeviceCount() > 0
+    except Exception:
+        HAS_GPU = False
+    if not HAS_GPU: _gpu_why = "CuPy imported but no CUDA device/driver visible"
 except Exception:
     HAS_GPU = False
-    print("[GPU] CuPy not available — running CPU-only mode")
+    _gpu_why = "CuPy not available"
+if HAS_GPU and os.environ.get('KPP_GPU', '').strip() == '0':
+    HAS_GPU = False
+    _gpu_why = "KPP_GPU=0"
+if HAS_GPU:
+    try:
+        _gpu_props = cp.cuda.runtime.getDeviceProperties(0)
+        _gpu_name = _gpu_props['name']
+        if isinstance(_gpu_name, bytes): _gpu_name = _gpu_name.decode()
+        print(f"[GPU] {_gpu_name}, {_gpu_props['totalGlobalMem']/1e9:.1f} GB VRAM")
+    except Exception as _e:          # device counted but not queryable: don't trust it
+        HAS_GPU = False
+        _gpu_why = f"CUDA device not usable ({_e})"
+if not HAS_GPU:
+    print(f"[GPU] CPU mode ({_gpu_why})")
 
 # psutil lets chunk sizes track ACTUAL free host RAM instead of a hardcoded row count.
 # Optional: without it we fall back to a conservative fixed budget.
@@ -454,6 +473,19 @@ class MainWindow(QMainWindow):
         n_total = n_rows_total if n_rows_total is not None else self.nrows
         return max(1, min(int(n_total), int(budget // max(bytes_per_row, 1))))
 
+    def _host_padded_chunk_rows(self, bytes_per_pixel_live, sr):
+        """Like _host_chunk_rows, for the GPU shift-and-compare passes whose host-side
+        block is PADDED: a chunk of r scan rows is staged as (r + 2*sr) x (ncols + 2*sr)
+        patterns, so `bytes_per_pixel_live` is charged on that padded grid, not on
+        r x ncols. Same budget as _host_chunk_rows. Returns at least 1 even if one row
+        plus its border does not fit (nothing smaller exists)."""
+        ncols, sr = int(self.ncols), int(sr)
+        # Budget expressed in ncols-wide rows (uncapped by the scan height), then
+        # converted to padded rows and the 2*sr border rows taken off.
+        grid_rows = self._host_chunk_rows(bytes_per_pixel_live, n_rows_total=1 << 40)
+        r = (grid_rows * ncols) // (ncols + 2 * sr) - 2 * sr
+        return max(1, min(int(self.nrows), r))
+
     def _invalidate_global_range(self):
         """Discard cached global-stretch bounds. Call on file load or when the
         background configuration changes (subtract/divide/off, or recomputed mean)."""
@@ -766,10 +798,13 @@ class MainWindow(QMainWindow):
         vram_budget = int(cp.cuda.Device(0).mem_info[1] * 0.5)
         CHUNK_ROWS = max(2, vram_budget // mem_per_row)
         CHUNK_ROWS = min(CHUNK_ROWS, self.nrows)
-        # Host RAM caps this too: the float32 read and the float32 `padded` block are both
-        # live at once (~4+4 B/px, plus border rows), and an 8.5 GB GPU on a 33 GB host can
-        # easily pick a chunk that fits VRAM but not RAM.
-        CHUNK_ROWS = min(CHUNK_ROWS, self._host_chunk_rows(12))
+        # Host RAM caps this too (an 8.5 GB GPU on a 33 GB host, or a 94 GB H100 on a wide
+        # scan, can pick a chunk that fits VRAM but not RAM). Live on the host at the peak,
+        # i.e. while `padded` is filled: the float32 read (4 B/px; a file read's native
+        # uint8/16 buffer is already gone by then) + the float32 `padded` block (4 B/px)
+        # = 8 B/px, charged on the padded (rows+2) x (ncols+2) grid. valid/σ² are per
+        # pattern, not per pixel. After upload the host holds only the σ² row block.
+        CHUNK_ROWS = min(CHUNK_ROWS, self._host_padded_chunk_rows(8, sr))
 
         for chunk_start in range(0, n_avail, CHUNK_ROWS):
             chunk_rows = min(CHUNK_ROWS, n_avail - chunk_start)
@@ -907,13 +942,14 @@ class MainWindow(QMainWindow):
         nlobj.getinfileobj = infile
         return True
 
-    def _nlpar_result_to_ram(self, nlobj):
-        """Point a pyebsdindex NLPAR object's OUTPUT at a second in-RAM array
-        (self.nlpar_patterns) instead of _cpu_nlpar_result.up1 (Max, 2026-09-28: only
-        Apply && Save should write to disk). Needs the original in RAM and room for a
-        second copy (same 60%-of-available rule as the load); otherwise returns False
-        and the caller writes the temp file as before. KPP_NLPAR_IN_MEMORY=0 forces
-        the file."""
+    def _alloc_nlpar_ram(self, tag="[CPU NLPAR]"):
+        """Allocate self.nlpar_patterns, the in-RAM NLPAR batch result (same shape and
+        native dtype as self.patterns), for either batch path to write into. Needs the
+        original in RAM and room for a second copy (same 60%-of-available rule as the
+        load); otherwise returns False and the caller writes its temp file.
+        KPP_NLPAR_IN_MEMORY=0 forces the file. Only whole rows [0, n_actual_rows) are
+        produced by NLPAR; the partial last row of a map stopped early is copied here
+        from the original. `tag` only prefixes the console message."""
         if self.patterns is None:
             return False
         if os.environ.get('KPP_NLPAR_IN_MEMORY', '').strip().lower() in ('0', 'no', 'false'):
@@ -921,13 +957,22 @@ class MainWindow(QMainWindow):
         self.nlpar_patterns = None           # free a previous result first
         need = self.patterns.nbytes; avail = available_ram()
         if need > 0.6 * avail:
-            print(f"[CPU NLPAR] result goes to disk: a second {need/1e9:.1f} GB copy does not fit "
+            print(f"{tag} result goes to disk: a second {need/1e9:.1f} GB copy does not fit "
                   f"({avail/1e9:.0f} GB available to this process)")
             return False
         self.nlpar_patterns = np.empty_like(self.patterns)
         n_full = int(getattr(self, 'n_actual_rows', self.nrows)) * int(self.ncols)
-        if n_full < self.nlpar_patterns.shape[0]:      # partial last row: pyebsdindex does whole rows only
+        if n_full < self.nlpar_patterns.shape[0]:      # partial last row: NLPAR does whole rows only
             self.nlpar_patterns[n_full:] = self.patterns[n_full:]
+        return True
+
+    def _nlpar_result_to_ram(self, nlobj):
+        """Point a pyebsdindex NLPAR object's OUTPUT at a second in-RAM array
+        (self.nlpar_patterns) instead of _cpu_nlpar_result.up1 (Max, 2026-09-28: only
+        Apply && Save should write to disk). Allocation rules: _alloc_nlpar_ram. Returns
+        False (caller writes the temp file as before) when it does not fit."""
+        if not self._alloc_nlpar_ram():
+            return False
         out = RamOutUPFile(self.orig_path, self.nlpar_patterns)
         def outfile():
             if nlobj.nrows is not None: out.nRows = nlobj.nrows
@@ -1604,20 +1649,33 @@ class MainWindow(QMainWindow):
         mask = self._get_iq_mask()  # (nrows, ncols) bool
         n_avail = getattr(self, 'n_actual_rows', self.nrows)
 
-        # Output file setup
-        tmp_dir = os.path.dirname(self.orig_path)
-        out_path = os.path.join(tmp_dir, "_gpu_nlpar_result.up1")
-        # Create the file ourselves: source header verbatim + sparse truncate to the
-        # number of patterns the source actually has. Letting pyebsdindex create it
-        # pre-fills every pattern with zeros one tofile() at a time (see apply_and_save).
-        hdr_len = int(self.f_orig.filePos)
-        with open(self.orig_path, 'rb') as f_src:
-            hdr = f_src.read(hdr_len)
-        with open(out_path, 'wb') as f_dst:
-            f_dst.write(hdr)
-            f_dst.truncate(hdr_len + int(getattr(self, 'n_actual_pats', self.nrows * self.ncols)) * ph * pw
-                           * (2 if self.orig_path.lower().endswith('.up2') else 1))
-        out_obj = ebsd_pattern.get_pattern_file_obj(out_path)
+        # Output: the in-RAM result array when a second copy of the scan fits (same rule
+        # and partial-row handling as the CPU batch, see _alloc_nlpar_ram), else the
+        # temp file as before.
+        to_ram = self._alloc_nlpar_ram(tag="[GPU NLPAR]")
+        # Rows NLPAR produces: only the full rows that were recorded, like the CPU path
+        # (nlobj.nrows = n_actual_rows). The partial last row is copied from the original
+        # (RAM: by _alloc_nlpar_ram; file: it is beyond what we write, and the reader
+        # returns zeros there). Looping to the header's nrows used to crash on a map
+        # stopped early once a chunk started past the recorded rows (read_r1 < read_r0
+        # gave a negative slice; reviewer fix 2026-09-28).
+        n_rows_loop = int(n_avail)
+        out_path = None
+        if not to_ram:
+            # Output file setup
+            tmp_dir = os.path.dirname(self.orig_path)
+            out_path = os.path.join(tmp_dir, "_gpu_nlpar_result.up1")
+            # Create the file ourselves: source header verbatim + sparse truncate to the
+            # number of patterns the source actually has. Letting pyebsdindex create it
+            # pre-fills every pattern with zeros one tofile() at a time (see apply_and_save).
+            hdr_len = int(self.f_orig.filePos)
+            with open(self.orig_path, 'rb') as f_src:
+                hdr = f_src.read(hdr_len)
+            with open(out_path, 'wb') as f_dst:
+                f_dst.write(hdr)
+                f_dst.truncate(hdr_len + int(getattr(self, 'n_actual_pats', self.nrows * self.ncols)) * ph * pw
+                               * (2 if self.orig_path.lower().endswith('.up2') else 1))
+            out_obj = ebsd_pattern.get_pattern_file_obj(out_path)
 
         # Adaptive chunk size based on VRAM and pattern dimensions
         pat_bytes = ph * pw * 4  # float32
@@ -1626,20 +1684,33 @@ class MainWindow(QMainWindow):
         vram_budget = int(cp.cuda.Device(0).mem_info[1] * 0.6)  # use 60% of total VRAM
         CHUNK_ROWS = max(2, vram_budget // mem_per_row)
         CHUNK_ROWS = min(CHUNK_ROWS, self.nrows)
-        # Host-side cap: float32 read + float32 `padded` + the float32 result pulled back
-        # from the GPU are all live at once (~12 B/px, plus border rows). Fitting VRAM is
-        # not the same as fitting RAM.
-        CHUNK_ROWS = min(CHUNK_ROWS, self._host_chunk_rows(12))
-        print(f"[GPU NLPAR] Pattern: {ph}x{pw}, VRAM budget: {vram_budget/1e9:.1f} GB, CHUNK_ROWS: {CHUNK_ROWS}")
+        # Host-side caps (fitting VRAM is not fitting RAM: a 94 GB H100 on a 2131-col scan
+        # picks chunks whose host-side float32 `padded` block alone is tens of GB).
+        # Two phases, never live together:
+        #  * staging: float32 read (4 B/px; a file read's native buffer is gone by then)
+        #    + float32 `padded` (4 B/px) = 8 B/px on the PADDED (rows+2sr) x (ncols+2sr)
+        #    grid. pad_mask/pad_sigma are per pattern, negligible. Freed after upload.
+        #  * result: float32 result_np (4) + pat_flt2int's float32 clip() copy (4) + its
+        #    uint8/16 astype (1-2) + its zeros output (1-2) = 10-12 B/px on rows x ncols
+        #    (same in file mode: write_data runs the same pat_flt2int). cp.asnumpy's
+        #    transient before .astype is 4+4 = 8, below that.
+        # The in-RAM result array itself was sized by _alloc_nlpar_ram (<= 60% of available)
+        # and is not committed yet (np.empty), so the 25%-of-available chunk budget below
+        # still leaves headroom as the chunks fill it, as in the CPU path.
+        CHUNK_ROWS = min(CHUNK_ROWS, self._host_padded_chunk_rows(8, sr),
+                         self._host_chunk_rows(12))
+        print(f"[GPU NLPAR] Pattern: {ph}x{pw}, VRAM budget: {vram_budget/1e9:.1f} GB, CHUNK_ROWS: {CHUNK_ROWS}"
+              f", rows={n_rows_loop}/{self.nrows} -> {'RAM' if to_ram else out_path}")
 
-        for chunk_start in range(0, self.nrows, CHUNK_ROWS):
-            chunk_rows = min(CHUNK_ROWS, self.nrows - chunk_start)
+        for chunk_start in range(0, n_rows_loop, CHUNK_ROWS):
+            chunk_rows = min(CHUNK_ROWS, n_rows_loop - chunk_start)
 
             # Read range with border (clamped to available data)
             read_r0 = max(0, chunk_start - sr)
             read_r1 = min(n_avail, chunk_start + chunk_rows + sr)
-            # Also cap to nrows for mask indexing
-            mask_r1 = min(self.nrows, chunk_start + chunk_rows + sr)
+            # Cap for mask indexing: rows that were never recorded are not neighbours
+            # (as in the CPU path).
+            mask_r1 = min(n_rows_loop, chunk_start + chunk_rows + sr)
 
             if read_r1 > read_r0:
                 data_np = self._read_rows(self.f_orig, read_r0, read_r1 - read_r0, as_float=True)
@@ -1733,20 +1804,38 @@ class MainWindow(QMainWindow):
             result_np[~mask_chunk] = 0.0
 
             # Write to output
-            out_obj.write_data(newpatterns=result_np, patStartCount=[chunk_start * self.ncols, -1], writeHead=False)
+            if to_ram:
+                # Exactly what out_obj.write_data(result_np, [p0, -1]) would have put in
+                # the file: its 1-D branch calls pat_flt2int(pats, typeout=<file dtype>,
+                # method='clip', scalevalue=0.98, maxScale=None) on the whole block.
+                p0 = chunk_start * int(self.ncols)
+                pat2write = ebsd_pattern.pat_flt2int(result_np, typeout=self.f_orig.filedatatype,
+                                                     method='clip', scalevalue=0.98, maxScale=None)
+                self.nlpar_patterns[p0:p0 + pat2write.shape[0]] = pat2write
+                del pat2write
+            else:
+                out_obj.write_data(newpatterns=result_np, patStartCount=[chunk_start * self.ncols, -1], writeHead=False)
             del result_np
 
             elapsed_so_far = time.time() - t0
             rows_done = chunk_start + chunk_rows
-            eta = (elapsed_so_far / rows_done) * (self.nrows - rows_done) if rows_done > 0 else 0
+            eta = (elapsed_so_far / rows_done) * (n_rows_loop - rows_done) if rows_done > 0 else 0
             self.statusBar().showMessage(
-                f"NLPAR GPU: row {rows_done}/{self.nrows} ({elapsed_so_far:.0f}s, ETA {eta:.0f}s)")
+                f"NLPAR GPU: row {rows_done}/{n_rows_loop} ({elapsed_so_far:.0f}s, ETA {eta:.0f}s)")
             QApplication.processEvents()
 
         elapsed = time.time() - t0
         # Free the full-dataset σ² we kept on GPU.
         del g_sigma_full
         cp.get_default_memory_pool().free_all_blocks()
+        if to_ram:
+            self.f_nlpar = RamUPFile(self.orig_path, self.nlpar_patterns)
+            self.nlpar_chk.setChecked(False)
+            self.nlpar_status.setText(f"NLPAR in RAM (GPU): SR={sr}, lam={lam:.2f} ({elapsed:.1f}s)")
+            self.statusBar().showMessage(f"NLPAR GPU complete in RAM ({elapsed:.1f}s)")
+            print(f"[GPU NLPAR] done in {elapsed:.1f}s -> RAM")
+            self.update_display()
+            return
         self._temp_files.append(out_path)
         self.f_nlpar = ebsd_pattern.get_pattern_file_obj(out_path)
         self.nlpar_chk.setChecked(False)
@@ -1859,6 +1948,14 @@ class MainWindow(QMainWindow):
             vram_budget = int(cp.cuda.Device(0).mem_info[1] * 0.5)
             CHUNK_ROWS = max(2, vram_budget // mem_per_row)
             CHUNK_ROWS = min(CHUNK_ROWS, self.nrows)
+            # Host side of the GPU branch of _process_chunk_batch, at its peak (the final
+            # np.clip(result * 255.0, 0, 255)): native read (1-2 B/px, 0 for a RAM view)
+            # + the float64 argument still referenced by the caller (8) + float64 `result`
+            # from cp.asnumpy(d).astype(np.float64) (8) + `result * 255.0` temporary (8)
+            # + np.clip output (8) ≈ 33 B/px. Earlier moments are lower: the float32 host
+            # staging of cp.asarray(chunk, float32) if CuPy casts on the host (4), and
+            # cp.asnumpy's float32 copy (4) while `result` is cast. No padding here.
+            CHUNK_ROWS = min(CHUNK_ROWS, self._host_chunk_rows(33))
         else:
             CHUNK_ROWS = self.nrows
         # VRAM is only half the story: the chunk also lives in host RAM as the native read
@@ -1956,14 +2053,16 @@ class MainWindow(QMainWindow):
         checked-but-disabled box can't keep affecting processing. Uses blockSignals
         around state changes to avoid recursive/duplicate update_display calls."""
         dyn_on = self.dyn_bg_chk.isChecked()
-        static_on = self.static_bg_chk.isChecked()
         # Dynamic active → static and global stretch are disabled (and unchecked).
         for w, should_disable in ((self.static_bg_chk, dyn_on), (self.global_chk, dyn_on)):
             if should_disable and w.isChecked():
                 w.blockSignals(True); w.setChecked(False); w.blockSignals(False)
             w.setEnabled(not should_disable)
         # Static (or global, which implies static domain) active → dynamic disabled.
-        block_dyn = static_on or self.global_chk.isChecked()
+        # Re-read: the loop above may just have unchecked static because dynamic won
+        # (a stale `static_on` used to end with BOTH boxes off when a script set
+        # static and then dynamic; the GUI could not reach that. 2026-09-28)
+        block_dyn = self.static_bg_chk.isChecked() or self.global_chk.isChecked()
         if block_dyn and self.dyn_bg_chk.isChecked():
             self.dyn_bg_chk.blockSignals(True); self.dyn_bg_chk.setChecked(False); self.dyn_bg_chk.blockSignals(False)
         self.dyn_bg_chk.setEnabled(not block_dyn)

@@ -162,6 +162,50 @@ activate if CuPy is installed on a GPU node.
     display read equal to the array. README 4.3 table has a new column for
     the memory this needs (two dataset-sized arrays).
 
+15. **GPU mode usable on OSC; GPU NLPAR result in RAM** (2026-09-28, v1.4.0;
+    three sonnet/opus agents did the work, Max's ask was "the small things" for
+    GPU desktops; Claude Fable reviewed). CuPy 14.2.0 (`cupy-cuda12x`, log
+    `~/EBSD/venv_cupy_install.log`) is in the venv; it brings no CUDA runtime
+    wheels, so the `cuda/12.9.1` Lmod module must be loaded (NVRTC for kernel
+    compilation, libs on LD_LIBRARY_PATH). `run_gui.sh` loads it if present,
+    prints `nvidia-smi -L` or "no GPU in this job: CPU mode", and with
+    `KPP_GPU=0` also sets `CUDA_VISIBLE_DEVICES=""`. `setup_all.sh` installs
+    CuPy only with `WITH_CUPY=1`. In the app: the HAS_GPU block now requires
+    `cp.cuda.runtime.getDeviceCount() > 0` (importing CuPy succeeds on nodes
+    without a driver; only device calls raise `cudaErrorNoDevice`), honours
+    `KPP_GPU=0`, and prints `[GPU] <name>, <n> GB VRAM` or
+    `[GPU] CPU mode (<reason>)`; `_gpu_why` holds the reason. NO CuPy-specific
+    plumbing was added: `_alloc_nlpar_ram(tag)` is the allocation half of #14's
+    `_nlpar_result_to_ram`, split out so `_apply_nlpar_gpu` can use the same
+    host array; the GPU batch writes each chunk with
+    `ebsd_pattern.pat_flt2int(result_np, typeout=<file dtype>, method='clip',
+    scalevalue=0.98, maxScale=None)`, which is exactly what `write_data`'s 1-D
+    branch did into the temp file (checked byte-for-byte, incl. negatives and
+    >255), then `self.f_nlpar = RamUPFile(...)` as in the CPU path; falls back
+    to `_gpu_nlpar_result.up1` when a second copy does not fit. New
+    `_host_padded_chunk_rows(bpp, sr)` = `_host_chunk_rows` charged on the
+    padded (rows+2sr)x(ncols+2sr) host block; GPU sigma map uses 8 B/px on it,
+    GPU NLPAR min(padded 8 B/px, 12 B/px on the chunk for the result/flt2int
+    copies), GPU Apply && Save adds `_host_chunk_rows(33)` (float64 argument +
+    result + `*255` temporary + clip output). Two reviewer fixes: (1) the GPU
+    NLPAR file path looped to the header's nrows and crashed on a map stopped
+    early once a chunk started past the recorded rows (`read_r1 < read_r0`
+    -> negative slice); it now loops over `n_actual_rows` like the CPU path,
+    with `mask_r1` capped there too. (2) `_sync_bg_controls` read `static_on`
+    before the loop that may uncheck static, so a script setting static then
+    dynamic ended with both off (the GUI could not reach it; osc_selftest.py
+    had been running with neither background on while labelled "bg sub +
+    dyn"); it re-reads the state now. Verification: CPU tests
+    (`test_truncated_save.py`, `test_nlpar_ram_out.py` in the session
+    scratchpad) PASS; the GPU NLPAR code was exercised on the login node with
+    numpy standing in for CuPy (`test_gpu_shim.py`): RAM result byte-identical
+    to file result, truncated-map loop covers n_actual_rows, partial row equals
+    the original. NOT yet run on a real GPU: `osc_gpu_selftest.py` +
+    `gpu_selftest.sbatch` (gpu partition, 1 H100, 24 cores, 1 h) are ready and
+    validated with `sbatch --test-only`; ask Max before submitting. Parity work
+    (border windows, saturation, sigma guards, IQ mask) is listed in README
+    4.11 and in Claude's memory `project_gpu_nlpar_parity`.
+
 Measured on the login node (8 threads), full Ni scan 32.4 GB from HOME:
 - read into RAM: 34.2 s cold (945 MB/s), 14.9 s partly cached
 - load statistics (IQ / mean / pixel std) after the read: 46 s at 8 threads
