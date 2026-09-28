@@ -127,6 +127,22 @@ activate if CuPy is installed on a GPU node.
     to the source, and the data is byte-equal to the first 5360 patterns of the
     full-file save. Full 20-row save 34.7 s vs ~60-75 s before (the pre-fill).
 
+13. **Optimize Lambda / NLPAR batch read from RAM** (2026-09-28). Max reported
+    Optimize Lambda "still slow as shit" on the DDC scan (31 GB, stopped early).
+    Nothing truncation-specific: pyebsdindex reads the scan ITSELF through
+    `getinfileobj().read_data()` -- tile by tile, one np.fromfile per row, a
+    single NFS stream at 130-220 MB/s -- so every Optimize Lambda and every
+    NLPAR batch re-read the whole file (3-4 min for 31 GB) although the same
+    bytes were already in `self.patterns`. New `RamUPFile(ebsd_pattern.UPFile)`
+    keeps the real header/copy_file and serves `read_data` (contiguous and
+    [[c,r],[nc,nr]] slab forms, `returnArrayOnly=True`) from the RAM array with
+    the same dtype casts as `pat_reader`. `_serve_nlpar_from_ram(nlobj)` binds
+    it as `nlobj.getinfileobj` (mirroring its nrows/ncols sync, so the capped
+    row count of a map stopped early still applies). Console line shows
+    `source=RAM` or `source=file` (streamed datasets keep reading the file).
+    Verified on the 20-row subset: lambda and the NLPAR output md5 identical
+    for the file path and the RAM path.
+
 Measured on the login node (8 threads), full Ni scan 32.4 GB from HOME:
 - read into RAM: 34.2 s cold (945 MB/s), 14.9 s partly cached
 - load statistics (IQ / mean / pixel std) after the read: 46 s at 8 threads

@@ -1,4 +1,4 @@
-__version__ = "1.1.0"   # shown in the window title; bump with each release (git tag v<version>)
+__version__ = "1.2.0"   # shown in the window title; bump with each release (git tag v<version>)
 import sys
 import os
 import glob
@@ -238,6 +238,54 @@ class PatternCanvas(FigureCanvas):
             else:
                 self.ax.imshow(pat, cmap='gray')
         self.ax.set_title(title); self.ax.axis('off'); self.draw_idle()
+
+
+class RamUPFile(ebsd_pattern.UPFile):
+    """pyebsdindex pattern-file object whose reads are served from the in-RAM copy of
+    the dataset (2026-09-28). NLPAR.opt_lambda / calcsigma / calcnlpar read the scan
+    THEMSELVES through getinfileobj().read_data(): tile by tile, row by row, one
+    np.fromfile per row, single stream from NFS. For a 31 GB scan that is 3-4 min of
+    reading per Optimize Lambda and again per NLPAR batch, while the very same bytes
+    already sit in self.patterns. Header, copy_file (the NLPAR output is cloned from
+    the input) and everything else stay the real UPFile's; only read_data is served
+    from RAM. Values are identical: the file's native dtype, cast exactly as
+    pat_reader would (convertToFloat -> float32)."""
+    def __init__(self, path, ram):
+        super().__init__(path)
+        self.read_header()
+        self._ram = ram                      # (n_patterns, ph, pw) view, native dtype
+
+    def _xyloc(self, idx):
+        yx = np.unravel_index(idx.astype(np.uint64), (int(self.nRows), int(self.nCols)))
+        xyloc = np.array([yx[1], yx[0]]).T.copy().astype(np.float32)
+        xyloc[:, 0] -= self.nCols * 0.5; xyloc[:, 1] -= self.nRows * 0.5
+        xyloc[:, 0] *= self.xStep;        xyloc[:, 1] *= self.yStep
+        return xyloc
+
+    def read_data(self, path=None, convertToFloat=False, patStartCount=[0, -1], returnArrayOnly=False):
+        if not returnArrayOnly:              # packaged EBSDPatterns object: not used by NLPAR
+            return super().read_data(path=path, convertToFloat=convertToFloat,
+                                     patStartCount=patStartCount, returnArrayOnly=False)
+        psc = np.asarray(patStartCount, dtype=np.int64)
+        typeout = np.float32 if convertToFloat else self.filedatatype
+        ph, pw = int(self.patternH), int(self.patternW)
+        ncols, nrows = int(self.nCols), int(self.nRows)
+        if psc.ndim == 1:                    # contiguous run of patterns
+            p0 = int(psc[0]); n = int(psc[-1])
+            if n == -1: n = int(self.nPatterns) - p0
+            n = max(1, min(n, int(self.nPatterns) - p0, self._ram.shape[0] - p0))
+            pats = self._ram[p0:p0 + n].astype(typeout)
+            idx = np.arange(p0, p0 + n, dtype=np.int64)
+        else:                                # [[col0, row0], [ncols, nrows]] slab
+            c0, nc = int(psc[0, 0]), int(psc[1, 0]); r0, nr = int(psc[0, 1]), int(psc[1, 1])
+            if nc < 0: nc = ncols - c0
+            if nr < 0: nr = nrows - r0
+            nc = min(nc, ncols - c0); nr = min(nr, nrows - r0)
+            grid = self._ram[:nrows * ncols].reshape(nrows, ncols, ph, pw)   # view
+            pats = grid[r0:r0 + nr, c0:c0 + nc].reshape(nr * nc, ph, pw).astype(typeout)
+            idx = (np.arange(r0, r0 + nr, dtype=np.int64)[:, None] * ncols
+                   + np.arange(c0, c0 + nc, dtype=np.int64)[None, :]).ravel()
+        return pats, self._xyloc(idx)
 
 
 class MainWindow(QMainWindow):
@@ -819,6 +867,23 @@ class MainWindow(QMainWindow):
         return sigma_sq_map
 
     # ---- Base pattern retrieval (on-demand) ----
+    def _serve_nlpar_from_ram(self, nlobj):
+        """Make a pyebsdindex NLPAR object read the scan from self.patterns instead of
+        re-reading the file (no-op when the dataset is streamed). Mirrors what
+        NLPAR.getinfileobj() does with nrows/ncols so a capped row count (map stopped
+        early) still applies."""
+        if self.patterns is None:
+            return False
+        ram = RamUPFile(self.orig_path, self.patterns)
+        def infile():
+            if nlobj.nrows is None: nlobj.nrows = ram.nRows
+            else: ram.nRows = nlobj.nrows
+            if nlobj.ncols is None: nlobj.ncols = ram.nCols
+            else: ram.nCols = nlobj.ncols
+            return ram
+        nlobj.getinfileobj = infile
+        return True
+
     def _read_patterns(self, fobj, p0, n):
         """Patterns [p0, p0+n) of `fobj` in file order, regardless of row boundaries
         (used for the partial last row of a map that was stopped early). RAM view when
@@ -1406,6 +1471,7 @@ class MainWindow(QMainWindow):
             n_avail = getattr(self, 'n_actual_rows', self.nrows)
             if n_avail < self.nrows:
                 nlobj.nrows = int(n_avail)
+            from_ram = self._serve_nlpar_from_ram(nlobj)
             ap = self._current_aperture()
             if ap is not None:
                 nlobj.mask = (ap > 0).astype(np.uint8)
@@ -1417,7 +1483,8 @@ class MainWindow(QMainWindow):
             budget = self._nlpar_chunk_bytes()
             print(f"[OPT LAMBDA] file={os.path.basename(self.orig_path)} SR={sr} "
                   f"aperture={ap_label} N_p={N_p}/{ph*pw} ({100.0*N_p/(ph*pw):.1f}%) "
-                  f"rows={int(n_avail)}/{self.nrows} chunk_budget={budget/1e9:.2f} GB")
+                  f"rows={int(n_avail)}/{self.nrows} chunk_budget={budget/1e9:.2f} GB "
+                  f"source={'RAM' if from_ram else 'file'}")
             self.statusBar().showMessage(
                 f"Optimizing lambda (aperture={ap_label}, N_p={N_p})..."); QApplication.processEvents()
             nlobj.opt_lambda(chunksize=budget, automask=False, autoupdate=True, backsub=False)
@@ -1659,6 +1726,7 @@ class MainWindow(QMainWindow):
             n_avail = getattr(self, 'n_actual_rows', self.nrows)
             if n_avail < self.nrows:
                 nlobj.nrows = int(n_avail)
+            from_ram = self._serve_nlpar_from_ram(nlobj)
             ap = self._current_aperture()
             if ap is not None:
                 nlobj.mask = (ap > 0).astype(np.uint8)
@@ -1671,7 +1739,8 @@ class MainWindow(QMainWindow):
             budget = self._nlpar_chunk_bytes()
             print(f"[CPU NLPAR] SR={sr} lam={lam:.3f} aperture={ap_label} "
                   f"N_p={N_p}/{ph*pw} ({100.0*N_p/(ph*pw):.1f}%) "
-                  f"rows={int(n_avail)}/{self.nrows} chunk_budget={budget/1e9:.2f} GB -> {out_path}")
+                  f"rows={int(n_avail)}/{self.nrows} chunk_budget={budget/1e9:.2f} GB "
+                  f"source={'RAM' if from_ram else 'file'} -> {out_path}")
             result_path = nlobj.calcnlpar(chunksize=budget, saturation_protect=True,
                                           automask=False, backsub=False, fileout=out_path)
             elapsed = time.time() - t0
