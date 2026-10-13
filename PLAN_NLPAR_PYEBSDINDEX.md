@@ -90,6 +90,34 @@ small EBSD patterns pyebsdindex should be several times faster; on OSC's H100 th
 - Delete the CuPy NLPAR batch and sigma code; CuPy stays for Apply && Save, load stats.
 - Update README, OSC_HANDOFF.md, requirements; bump to 1.6.0.
 
+## Finding during Phase 1: pyebsdindex OpenCL kernel bug (2026-10-13)
+
+`pyebsdindex/opencl/clnlpar.cl`, kernel `calcnlpar`, "calculate the weights" loop:
+
+    sigma_ij = sigma[indx_xy];     // centre's sigma, for every neighbour
+                                   // meant: sigma_ij = sigma[indx_ij];
+
+so the GPU weight normalises with 2*sigma_i^2 instead of sigma_i^2 + sigma_j^2. The
+`normd` kernel and the numba CPU kernel index correctly. Present in 0.3.9.1 (installed)
+and in upstream `main` on 2026-10-13; no issue filed upstream for it. Measured on a
+synthetic 24x16 scan with noise sigma 6 (left half) / 35 (right half), SR 3:
+
+| comparison | interior mean abs diff | interior max | noise-boundary cols |
+|---|---|---|---|
+| CPU vs GPU as shipped | 2.8 | 119 | 14.1 |
+| CPU vs GPU with the one-line fix | 0.000 | 1 | 0.000 |
+
+The viewer applies the fix at runtime (`_patch_pyebsdindex_nlpar_kernel`: patched copy
+of the kernel in the temp dir, pyebsdindex's `get_context` redirected to it; no-op once
+upstream fixes it; `KPP_NLPAR_KERNEL_PATCH=0` disables). **To do: report / PR upstream
+(Max decides).** Phase 4's expectation "GPU vs CPU near-identical" holds only with the
+fix and only in the interior: borders differ by design (CPU shifts the window inward,
+GPU mirrors) and the saturation threshold differs (0.999 vs 0.9961 of max).
+
 ## Status
 - 2026-10-13: decision taken; Phase 0 done on the laptop (pyopencl 2026.1.4 installed,
   KPP_GPU=0 import guard, requirements note). OSC side of Phase 0 not started.
+- 2026-10-13: Phase 1 done on the laptop (v1.6.0.dev1): batch routed to pyebsdindex,
+  shared NLPAR object with sigma reuse, progress hook, legacy engine behind
+  KPP_NLPAR_ENGINE=legacy, kernel bug work-around. Verified on a synthetic scan only
+  (see OSC_HANDOFF.md v1.6.0.dev1). Not yet run on real data, not yet pushed/run on OSC.

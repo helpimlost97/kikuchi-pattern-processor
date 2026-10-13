@@ -37,10 +37,15 @@ turned out to be useful enough to publish.
   IQ range filtering, semi-transparent mask overlay for excluded patterns
 - **NLPAR** using the canonical Brewick et al. 2019 formulation with
   dimensionless λ and a σ²-normalized weight: `w(i,j) = exp(-max(d̃, 0) / λ²)`
-  - GPU-accelerated batch via CuPy (adaptive `CHUNK_ROWS` sized to 60% of
-    total VRAM, padded shift-and-compare over the full search-radius window)
+  - Full-dataset batch runs through **pyebsdindex's own NLPAR** (v1.6): its
+    OpenCL kernels when `pyopencl` sees a GPU, numba on the CPU otherwise. The
+    σ map from Optimize λ is reused by the batch. The viewer patches one line of
+    pyebsdindex's OpenCL kernel at startup (neighbour σ indexed as the centre σ;
+    see `PLAN_NLPAR_PYEBSDINDEX.md`); `KPP_NLPAR_KERNEL_PATCH=0` disables that.
   - On-demand single-pixel preview before committing to the full pass
   - **Optimize λ** delegates to `pyebsdindex.nlpar.NLPAR.opt_lambda`
+  - The pre-1.6 CuPy shift-and-compare batch is still in the file behind
+    `KPP_NLPAR_ENGINE=legacy` for comparison and will be removed
 - **NPAR** as a uniform-weight special case (single-pixel preview only;
   use NLPAR with high λ for the equivalent batch behavior)
 - **Aperture masking** for the σ² estimate and the NLPAR distance term — three
@@ -86,14 +91,18 @@ _check_nlpar.py           Prints pyebsdindex UPFile source for introspection
   available, slower but functionally identical)
 - Python packages:
   - `PyQt5`
-  - `pyebsdindex` (UP1/UP2 I/O, NLPAR CPU path, λ optimization)
+  - `pyebsdindex` (UP1/UP2 I/O, NLPAR batch and σ estimate, λ optimization)
   - `numpy`, `scipy`, `scikit-image`, `matplotlib`
-  - `cupy-cuda12x` (or the variant matching your CUDA toolkit; omit for CPU-only)
+  - `pyopencl` (optional: NLPAR batch on the GPU through pyebsdindex's OpenCL
+    kernels; the NVIDIA driver provides the OpenCL runtime)
+  - `cupy-cuda12x` (optional: GPU previews, Apply && Save and load statistics;
+    pick the variant matching your CUDA toolkit)
 
 ### Install
 
 ```bash
-pip install pyqt5 pyebsdindex numpy scipy scikit-image matplotlib
+pip install pyqt5 pyebsdindex numpy scipy scikit-image matplotlib psutil
+pip install pyopencl       # NLPAR batch on the GPU (pyebsdindex OpenCL)
 pip install cupy-cuda12x   # only if you have CUDA; pick the matching variant
 ```
 
@@ -134,11 +143,11 @@ This tool would not exist without the libraries it stands on:
 
 - **[pyebsdindex](https://github.com/USNavalResearchLaboratory/pyebsdindex)** —
   David Rowenhorst and team at the U.S. Naval Research Laboratory.
-  All UP1/UP2 I/O, the canonical CPU NLPAR implementation, and the λ
-  optimization routine are pyebsdindex. The GPU NLPAR path in this tool is a
-  reimplementation of the same Brewick et al. 2019 math on CuPy; the result
-  files are written through pyebsdindex's `UPFile.write_data` and post-patched
-  for v4 header compatibility.
+  All UP1/UP2 I/O, the NLPAR batch (OpenCL and numba), the σ estimate and the
+  λ optimization routine are pyebsdindex. The single-pixel NLPAR preview is a
+  reimplementation of the same Brewick et al. 2019 math; the result files are
+  written through pyebsdindex's `UPFile.write_data` and post-patched for v4
+  header compatibility.
 - **[kikuchipy](https://github.com/pyxem/kikuchipy)** — the broader EBSD Python
   ecosystem (Håkon Wiik Ånes and contributors). Not currently a runtime
   dependency of this tool, but the obvious companion library for anything

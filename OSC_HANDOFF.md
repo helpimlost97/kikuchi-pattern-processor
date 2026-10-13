@@ -6,6 +6,47 @@ was done, what was verified, and what is deliberately NOT done yet.
 `OSC_SETUP.md` (from the original repo) is still the general Linux/OSC guide;
 this file is the delta on top of it.
 
+## v1.6.0.dev1 (2026-10-13): NLPAR batch through pyebsdindex (Phase 1 of PLAN_NLPAR_PYEBSDINDEX.md)
+
+Decision (Max, 2026-10-13): the full-dataset NLPAR runs through pyebsdindex's own
+`nlpar` module from now on, because it is the accepted, publicly used code. pyebsdindex
+picks the engine at import: its OpenCL kernels when `pyopencl` sees a GPU (laptop: RTX
+5070 via the NVIDIA driver; OSC: needs `pip install pyopencl` in `~/EBSD/venvs/kikuchi`
+and the NVIDIA OpenCL ICD on a GPU node, **not yet checked**), numba on the CPU
+otherwise. `KPP_GPU=0` now also forces the CPU module (OpenCL would otherwise still
+find the device). Startup prints `[NLPAR] engine: ...`.
+
+What changed in `gpu_pattern_viewer.py`:
+- `apply_nlpar_batch` -> `_apply_nlpar_pyebsdindex` (the old `_apply_nlpar_cpu` name is
+  kept as an alias for the selftest scripts). The CuPy shift-and-compare batch is only
+  reachable with `KPP_NLPAR_ENGINE=legacy`, for the Phase 4 comparison; it will be deleted.
+- One pyebsdindex `NLPAR` object per (dataset, aperture, rows) (`_get_nlobj`): Optimize
+  Lambda computes sigma (calcsigma, nn=1) and the batch reuses it, so no second sigma pass.
+  Cleared on file load and aperture change together with the lambda gate.
+- Progress: pyebsdindex exposes none, so `_hook_nlpar_progress` wraps the input object's
+  `read_data` and the output object's `pat_writer` (one call per written tile row) for a
+  percent / ETA in the status bar. Works for the RAM twins and real files.
+- Temp output name is now `_nlpar_result.up1/.up2` (was `_cpu_nlpar_result`).
+- **pyebsdindex OpenCL kernel bug, worked around**: `clnlpar.cl`, kernel `calcnlpar`,
+  weight loop reads `sigma[indx_xy]` (centre) instead of `sigma[indx_ij]` (neighbour), so
+  the GPU weight uses 2*sigma_i^2 instead of sigma_i^2 + sigma_j^2. Present in 0.3.9.1 and
+  upstream main. On a synthetic scan with two noise levels the shipped GPU output differs
+  from the CPU output by up to 119 grey levels along the noise boundary; with the one-line
+  fix, GPU == CPU exactly in the scan interior. `_patch_pyebsdindex_nlpar_kernel()` writes
+  a fixed copy of the kernel to the temp dir at startup and redirects pyebsdindex's
+  `get_context` to it (no-op once upstream fixes the line; `KPP_NLPAR_KERNEL_PATCH=0`
+  disables). Not yet reported upstream (Max's call).
+- Remaining GPU-vs-CPU difference inside pyebsdindex is at the scan border only: the
+  numba kernel shifts the window inward at edges, the OpenCL kernel mirrors indices.
+  Also the saturation threshold differs (CPU 0.999*max, GPU 0.9961*max).
+
+Verified headlessly (synthetic 24x16 scan, 48x48 uint8, SR 3): gate refuses the batch
+before Optimize Lambda; lambda via OpenCL and numba agree to 3 decimals; sigma reused by
+the batch; RAM result == file result byte-for-byte on both engines; progress hook counted
+every written pattern; circular aperture reaches pyebsdindex as `nlobj.mask`
+(N_p 1741/2304) and re-arms the gate. Not yet run on a real scan (Phase 4; dataset
+undecided).
+
 ## v1.5.0 (2026-10-10): UP2 / 16-bit support (uncommitted, not yet run on real data)
 
 Target dataset: `/fs/scratch/PAS2328/vegamichalak1/Scratch Downloads/FG10 TKD/FG TKD_FG10_Area 1_OIM Map 2.up2`

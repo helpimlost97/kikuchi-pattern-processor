@@ -1,4 +1,4 @@
-__version__ = "1.5.1"   # shown in the window title; bump with each release (git tag v<version>)
+__version__ = "1.6.0.dev1"   # shown in the window title; bump with each release (git tag v<version>)
 import sys
 import os
 import glob
@@ -41,6 +41,55 @@ if os.environ.get('KPP_GPU', '').strip() == '0':
     from pyebsdindex import nlpar_cpu as nlpar
 else:
     from pyebsdindex import nlpar
+# Which engine pyebsdindex resolved to. The NLPAR batch and Optimize Lambda both run
+# through it (Phase 1); the CuPy batch is only reachable with KPP_NLPAR_ENGINE=legacy.
+NLPAR_ON_GPU = nlpar.NLPAR.__module__.startswith('pyebsdindex.opencl')
+NLPAR_ENGINE = "pyebsdindex OpenCL" if NLPAR_ON_GPU else "pyebsdindex CPU (numba)"
+
+def _patch_pyebsdindex_nlpar_kernel():
+    """Work around a bug in pyebsdindex's OpenCL NLPAR kernel (clnlpar.cl, kernel
+    calcnlpar, 'calculate the weights' loop; present in 0.3.9.x and upstream main on
+    2026-10-13): it reads `sigma[indx_xy]` (the centre pattern's sigma) for every
+    neighbour where `sigma[indx_ij]` (the neighbour's sigma) is meant, so the weight's
+    (sigma_i^2 + sigma_j^2) becomes 2 sigma_i^2. The CPU (numba) kernel is right. On a
+    two-noise-level synthetic scan the shipped GPU result differs from the CPU result by
+    up to 119 intensity levels along the noise boundary; with this one-line fix the two
+    agree exactly in the scan interior (borders still differ: the CPU shifts the window
+    inward, the GPU mirrors indices).
+
+    openclparam.get_context builds `path.join(<package dir>, kfile)`, so handing it an
+    absolute kfile path redirects the build to a patched copy. The copy is regenerated
+    from the installed file at every start; once upstream fixes the line the replace is
+    a no-op and nothing is redirected. Reported upstream: see PLAN_NLPAR_PYEBSDINDEX.md."""
+    if not NLPAR_ON_GPU:
+        return None
+    try:
+        import hashlib, tempfile
+        from pyebsdindex.opencl import openclparam
+        src = os.path.join(os.path.dirname(openclparam.__file__), 'clnlpar.cl')
+        text = open(src, encoding='utf-8').read()
+        bad, good = "sigma_ij = sigma[indx_xy];", "sigma_ij = sigma[indx_ij];"
+        if text.count(bad) != 1:
+            return None                      # fixed upstream (or changed beyond recognition): leave it
+        fixed = text.replace(bad, good)
+        tag = hashlib.sha1(fixed.encode()).hexdigest()[:12]
+        kdir = os.path.join(tempfile.gettempdir(), 'kikuchi_pattern_processor')
+        os.makedirs(kdir, exist_ok=True)
+        dst = os.path.join(kdir, f'clnlpar_fixed_{tag}.cl')
+        if not os.path.exists(dst):
+            with open(dst, 'w', encoding='utf-8') as f: f.write(fixed)
+        orig = openclparam.OpenClParam.get_context
+        def get_context(self, gpu_id=None, kfile='clkernels.cl'):
+            if kfile == 'clnlpar.cl':
+                kfile = dst
+            return orig(self, gpu_id=gpu_id, kfile=kfile)
+        openclparam.OpenClParam.get_context = get_context
+        return dst
+    except Exception as _e:
+        print(f"[NLPAR] could not patch pyebsdindex's OpenCL kernel ({_e}); using it as shipped")
+        return None
+
+NLPAR_KERNEL_PATCH = None if os.environ.get('KPP_NLPAR_KERNEL_PATCH', '').strip() == '0' else _patch_pyebsdindex_nlpar_kernel()
 from scipy.ndimage import gaussian_filter
 from skimage.exposure import equalize_adapthist
 import time
@@ -84,6 +133,9 @@ if HAS_GPU:
         _gpu_why = f"CUDA device not usable ({_e})"
 if not HAS_GPU:
     print(f"[GPU] CPU mode ({_gpu_why})")
+print(f"[NLPAR] engine: {NLPAR_ENGINE}"
+      + (f"; OpenCL kernel sigma-index fix applied ({os.path.basename(NLPAR_KERNEL_PATCH)})" if NLPAR_KERNEL_PATCH
+         else ("; kernel used as shipped" if NLPAR_ON_GPU else "")))
 
 # psutil lets chunk sizes track ACTUAL free host RAM instead of a hardcoded row count.
 # Optional: without it we fall back to a conservative fixed budget.
@@ -366,6 +418,9 @@ class MainWindow(QMainWindow):
         # optimize_lambda succeeds; cleared on file load and aperture change (lambda is
         # fitted for one pixel mask). Editing the lambda box by hand does NOT clear it.
         self._lambda_optimized = False
+        # pyebsdindex NLPAR object shared by Optimize Lambda and the batch (sigma reuse);
+        # keyed on (path, aperture, rows). See _get_nlobj.
+        self._nlobj = None; self._nlobj_key = None; self._nlobj_from_ram = False
         self.nrows = self.ncols = self.current_row = self.current_col = 0
         self.mean_pattern = None; self.iq_map = None; self.iq_mask = None
         self.pixel_std = None  # per-pixel std across dataset, for variance-based aperture detection
@@ -459,6 +514,7 @@ class MainWindow(QMainWindow):
         self._invalidate_sigma_map()
         self._invalidate_global_range()
         self._lambda_optimized = False  # lambda was fitted for the previous aperture
+        self._nlobj = None; self._nlobj_key = None   # its sigma was computed under the old mask
         if self.f_orig is not None:
             self.update_display()
 
@@ -948,6 +1004,109 @@ class MainWindow(QMainWindow):
         return sigma_sq_map
 
     # ---- Base pattern retrieval (on-demand) ----
+    # ------------------------------------------------------------------
+    # pyebsdindex NLPAR object shared by Optimize Lambda and the batch
+    # (PLAN_NLPAR_PYEBSDINDEX.md, Phase 1). opt_lambda computes the sigma map
+    # (calcsigma, nn=1) and leaves it on the object; calcnlpar then reuses it instead
+    # of a second full pass. sigma depends on the dataset, the row cap and the pixel
+    # mask, not on SR or lambda, so the object is keyed on (path, aperture, rows) and
+    # SR / lambda are set per call.
+    # ------------------------------------------------------------------
+    def _get_nlobj(self, sr):
+        """Return (nlobj, from_ram) for the loaded dataset, creating it on a key change.
+        The aperture goes in as pyebsdindex's own pixel mask (nlobj.mask); mode 'None'
+        leaves it None and automask=False at the call sites makes that an all-ones mask."""
+        n_avail = int(getattr(self, 'n_actual_rows', self.nrows))
+        key = (self.orig_path, self._aperture_key(), n_avail)
+        if self._nlobj is None or self._nlobj_key != key:
+            nlobj = nlpar.NLPAR(self.orig_path, searchradius=int(sr))
+            # Truncated file: cap the scan rows pyebsdindex will read. getinfileobj()
+            # forces fID.nRows = self.nrows whenever self.nrows is not None.
+            if n_avail < self.nrows:
+                nlobj.nrows = n_avail
+            from_ram = self._serve_nlpar_from_ram(nlobj)
+            ap = self._current_aperture()
+            nlobj.mask = (ap > 0).astype(np.uint8) if ap is not None else None
+            self._nlobj, self._nlobj_key, self._nlobj_from_ram = nlobj, key, from_ram
+        nlobj = self._nlobj
+        nlobj.searchradius = int(sr)
+        return nlobj, self._nlobj_from_ram
+
+    def _nlobj_mask_info(self, nlobj):
+        """(N_p, label) for console / status messages."""
+        ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
+        if nlobj.mask is not None:
+            return int(np.asarray(nlobj.mask).sum()), self.aperture_mode.currentText()
+        return ph * pw, "None"
+
+    @staticmethod
+    def _reset_nlobj_output(nlobj):
+        """Drop any per-batch output override (_nlpar_result_to_ram replaces setoutfile /
+        getoutfileobj on the instance) so pyebsdindex's own file output applies again."""
+        for name in ('setoutfile', 'getoutfileobj'):
+            nlobj.__dict__.pop(name, None)
+
+    @staticmethod
+    def _unhook_nlpar_progress(nlobj):
+        prev = nlobj.__dict__.pop('_kpp_prev_io', None)
+        if prev is not None:
+            nlobj.getinfileobj, nlobj.getoutfileobj = prev
+
+    def _hook_nlpar_progress(self, nlobj, stage, total_pats):
+        """Drive the status bar from pyebsdindex's own I/O, which is the only progress
+        signal it exposes: every tile it reads goes through getinfileobj().read_data and
+        every tile it writes through getoutfileobj().pat_writer (the slab branch of
+        write_data recurses into one pat_writer call per row). Wraps whichever objects
+        are current, the real UPFile or the RAM-serving twins. Call _unhook first on an
+        object that was hooked before; returns a closure that prints the final state."""
+        t0 = time.time()
+        state = {'read': 0, 'written': 0, 'last': 0.0}
+        total = max(int(total_pats), 1)
+        def show(force=False):
+            now = time.time()
+            if not force and now - state['last'] < 0.5: return
+            state['last'] = now
+            el = now - t0
+            if state['written'] > 0:
+                frac = min(state['written'] / total, 1.0)
+                eta = (el / frac - el) if frac > 0 else 0.0
+                msg = f"{stage}: {100*frac:.0f}% written ({el:.0f}s, ETA {eta:.0f}s)"
+            else:
+                frac = min(state['read'] / total, 1.0)     # tiles overlap, so clamp
+                msg = f"{stage}: reading {100*frac:.0f}% ({el:.0f}s)"
+            self.statusBar().showMessage(msg); QApplication.processEvents()
+        self._nlpar_prog = {'state': state, 'show': show}   # the wrappers below read this
+        orig_in, orig_out = nlobj.getinfileobj, nlobj.getoutfileobj
+        win = self
+        def infile():
+            f = orig_in()
+            if f is not None and not getattr(f, '_kpp_hooked_in', False):
+                rd = f.read_data
+                def read_data(*a, **k):
+                    r = rd(*a, **k)
+                    try:
+                        n = r[0].shape[0] if isinstance(r, tuple) else getattr(r, 'nPatterns', 0)
+                        win._nlpar_prog['state']['read'] += int(n); win._nlpar_prog['show']()
+                    except Exception: pass
+                    return r
+                f.read_data = read_data; f._kpp_hooked_in = True
+            return f
+        def outfile():
+            f = orig_out()
+            if f is not None and not getattr(f, '_kpp_hooked_out', False):
+                pw_ = f.pat_writer
+                def pat_writer(pat2write, patStart, nPatToWrite, *a, **k):
+                    r = pw_(pat2write, patStart, nPatToWrite, *a, **k)
+                    try:
+                        win._nlpar_prog['state']['written'] += int(nPatToWrite); win._nlpar_prog['show']()
+                    except Exception: pass
+                    return r
+                f.pat_writer = pat_writer; f._kpp_hooked_out = True
+            return f
+        nlobj._kpp_prev_io = (orig_in, orig_out)
+        nlobj.getinfileobj, nlobj.getoutfileobj = infile, outfile
+        return lambda: show(force=True)
+
     def _serve_nlpar_from_ram(self, nlobj):
         """Make a pyebsdindex NLPAR object read the scan from self.patterns instead of
         re-reading the file (no-op when the dataset is streamed). Mirrors what
@@ -1439,6 +1598,7 @@ class MainWindow(QMainWindow):
         self._invalidate_sigma_map()      # sigma map belongs to the old scan
         self._invalidate_global_range()   # so do the global-stretch bounds
         self._lambda_optimized = False    # lambda gate re-arms for the new file
+        self._nlobj = None; self._nlobj_key = None   # pyebsdindex object (and its sigma) is per dataset
         self._aperture_cache = None; self._aperture_cache_key = None  # auto-detect mask is per dataset
         self.orig_path = path; self.f_orig = ebsd_pattern.get_pattern_file_obj(path)
         self.nrows, self.ncols = self.f_orig.nRows, self.f_orig.nCols
@@ -1648,43 +1808,37 @@ class MainWindow(QMainWindow):
         """
         if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1/UP2 file first"); return
         try:
+            t0 = time.time()
             sr = self.sr_spin.value()
             ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
-            nlobj = nlpar.NLPAR(self.orig_path, searchradius=sr)
-            # Truncated file: cap the scan rows pyebsdindex will read. getinfileobj()
-            # forces fID.nRows = self.nrows whenever self.nrows is not None, so setting
-            # the attribute here is enough (the constructor's nrows= kwarg does the same).
-            n_avail = getattr(self, 'n_actual_rows', self.nrows)
-            if n_avail < self.nrows:
-                nlobj.nrows = int(n_avail)
-            from_ram = self._serve_nlpar_from_ram(nlobj)
-            ap = self._current_aperture()
-            if ap is not None:
-                nlobj.mask = (ap > 0).astype(np.uint8)
-                N_p = int(nlobj.mask.sum())
-                ap_label = self.aperture_mode.currentText()
-            else:
-                N_p = ph * pw
-                ap_label = "None"
+            nlobj, from_ram = self._get_nlobj(sr)
+            self._unhook_nlpar_progress(nlobj)
+            n_avail = int(getattr(self, 'n_actual_rows', self.nrows))
+            N_p, ap_label = self._nlobj_mask_info(nlobj)
             budget = self._nlpar_chunk_bytes()
-            print(f"[OPT LAMBDA] file={os.path.basename(self.orig_path)} SR={sr} "
+            print(f"[OPT LAMBDA] engine={NLPAR_ENGINE} file={os.path.basename(self.orig_path)} SR={sr} "
                   f"aperture={ap_label} N_p={N_p}/{ph*pw} ({100.0*N_p/(ph*pw):.1f}%) "
-                  f"rows={int(n_avail)}/{self.nrows} chunk_budget={budget/1e9:.2f} GB "
+                  f"rows={n_avail}/{self.nrows} chunk_budget={budget/1e9:.2f} GB "
                   f"source={'RAM' if from_ram else 'file'}")
             self.statusBar().showMessage(
                 f"Optimizing lambda (aperture={ap_label}, N_p={N_p})..."); QApplication.processEvents()
+            self._hook_nlpar_progress(nlobj, "Optimize lambda (sigma pass)", n_avail * int(self.ncols))
             nlobj.opt_lambda(chunksize=budget, automask=False, autoupdate=True, backsub=False)
             self.lam_spin.setValue(float(nlobj.lam))
             self._lambda_optimized = True
-            print(f"[OPT LAMBDA] lambda = {float(nlobj.lam):.4f}  (N_p = {N_p})")
-            self.statusBar().showMessage(f"Optimal lambda: {float(nlobj.lam):.3f} (N_p={N_p})")
+            elapsed = time.time() - t0
+            print(f"[OPT LAMBDA] lambda = {float(nlobj.lam):.4f}  (N_p = {N_p}, {elapsed:.1f}s; "
+                  f"sigma kept on the NLPAR object for the batch)")
+            self.statusBar().showMessage(f"Optimal lambda: {float(nlobj.lam):.3f} (N_p={N_p}, {elapsed:.0f}s)")
         except Exception as e:
             import traceback; traceback.print_exc()
             self.statusBar().showMessage("Optimize lambda failed")
             QMessageBox.critical(self, "Optimize lambda failed", str(e))
 
     def apply_nlpar_batch(self):
-        """Run NLPAR on the full dataset. Uses GPU shift-and-compare when available, else pyebsdindex CPU."""
+        """Run NLPAR on the full dataset through pyebsdindex (OpenCL or numba, chosen at
+        import). The old CuPy shift-and-compare batch stays reachable only with
+        KPP_NLPAR_ENGINE=legacy for the Phase 4 comparison (PLAN_NLPAR_PYEBSDINDEX.md)."""
         if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1/UP2 file first"); return
         if not self._lambda_optimized:
             QMessageBox.information(self, "Optimize lambda first",
@@ -1694,17 +1848,20 @@ class MainWindow(QMainWindow):
             return
         sr, lam = self.sr_spin.value(), self.lam_spin.value()
 
-        if HAS_GPU:
-            # The CPU path reports its own failures; only the GPU path needs a guard
-            # here so an OOM/driver error becomes a dialog instead of killing the app.
+        if os.environ.get('KPP_NLPAR_ENGINE', '').strip().lower() == 'legacy':
+            if not HAS_GPU:
+                QMessageBox.warning(self, "Legacy NLPAR engine",
+                                    "KPP_NLPAR_ENGINE=legacy selects the CuPy batch, which needs a CUDA device.")
+                return
+            # Guard so an OOM/driver error becomes a dialog instead of killing the app.
             try:
                 self._apply_nlpar_gpu(sr, lam)
             except Exception as e:
                 import traceback; traceback.print_exc()
-                self.statusBar().showMessage("NLPAR (GPU) failed")
-                QMessageBox.critical(self, "NLPAR (GPU) failed", str(e))
-        else:
-            self._apply_nlpar_cpu(sr, lam)
+                self.statusBar().showMessage("NLPAR (legacy CuPy) failed")
+                QMessageBox.critical(self, "NLPAR (legacy CuPy) failed", str(e))
+            return
+        self._apply_nlpar_pyebsdindex(sr, lam)
 
     def _apply_nlpar_gpu(self, sr, lam):
         """GPU-accelerated NLPAR using the canonical Brewick/Wright/Rowenhorst 2019
@@ -1928,11 +2085,16 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"NLPAR GPU complete ({elapsed:.1f}s)")
         self.update_display()
 
-    def _apply_nlpar_cpu(self, sr, lam):
-        """CPU fallback: run pyebsdindex NLPAR straight off self.orig_path — no temp copy.
+    def _apply_nlpar_pyebsdindex(self, sr, lam):
+        """Full-dataset NLPAR through pyebsdindex, straight off self.orig_path (or the
+        in-RAM copy) — no temp copy of the input. pyebsdindex resolved the engine at
+        import (NLPAR_ENGINE): its OpenCL kernels when pyopencl sees a GPU, numba on the
+        CPU otherwise. The NLPAR object comes from _get_nlobj, so the sigma map computed
+        by Optimize Lambda is reused here instead of a second full pass; lambda and SR
+        are taken from the spin boxes (a hand-edited lambda wins over nlobj.lam).
 
-        Matches the GPU path's contract on two points that the old implementation got
-        wrong because it fed NLPAR a pre-masked duplicate of the scan:
+        Two contract points that the pre-OSC implementation got wrong because it fed
+        NLPAR a pre-masked duplicate of the scan:
 
         * Dead pixels KEEP their values in the output. They are excluded from the d2
           statistics via `nlobj.mask` (pyebsdindex turns that into the `indices` array
@@ -1948,41 +2110,44 @@ class MainWindow(QMainWindow):
         reserves the file, then each tile is written in place). Without `fileout`
         pyebsdindex names the file itself as `<stem>_NLPAR_l{lam}sr{sr}.up1`, so the
         glob below is kept as a fallback."""
+        label = "GPU" if NLPAR_ON_GPU else "CPU"
         try:
-            self.statusBar().showMessage(f"Running NLPAR batch CPU (SR={sr}, lam={lam:.2f})..."); QApplication.processEvents()
+            self.statusBar().showMessage(f"Running NLPAR batch, {NLPAR_ENGINE} (SR={sr}, lam={lam:.2f})..."); QApplication.processEvents()
             t0 = time.time()
             ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
-            nlobj = nlpar.NLPAR(self.orig_path, lam=lam, searchradius=sr)
-            n_avail = getattr(self, 'n_actual_rows', self.nrows)
-            if n_avail < self.nrows:
-                nlobj.nrows = int(n_avail)
-            from_ram = self._serve_nlpar_from_ram(nlobj)
+            nlobj, from_ram = self._get_nlobj(sr)
+            # Order matters: unhook restores the I/O methods as they were before the last
+            # hook, reset drops a previous batch's RAM output override, then this batch's
+            # output is decided and the progress hook wraps the final methods.
+            self._unhook_nlpar_progress(nlobj)
+            self._reset_nlobj_output(nlobj)
             to_ram = self._nlpar_result_to_ram(nlobj)
-            ap = self._current_aperture()
-            if ap is not None:
-                nlobj.mask = (ap > 0).astype(np.uint8)
-                N_p = int(nlobj.mask.sum())
-                ap_label = self.aperture_mode.currentText()
-            else:
-                N_p = ph * pw
-                ap_label = "None"
-            out_path = os.path.join(os.path.dirname(self.orig_path), "_cpu_nlpar_result" + self.src_ext)
-            budget = self._nlpar_chunk_bytes()
-            print(f"[CPU NLPAR] SR={sr} lam={lam:.3f} aperture={ap_label} "
+            n_avail = int(getattr(self, 'n_actual_rows', self.nrows))
+            N_p, ap_label = self._nlobj_mask_info(nlobj)
+            out_path = os.path.join(os.path.dirname(self.orig_path), "_nlpar_result" + self.src_ext)
+            budget = self._nlpar_chunk_bytes()      # CPU tiles; the OpenCL path sizes its own
+            sigma_reused = nlobj.sigma is not None and np.asarray(nlobj.sigma).size > 1
+            print(f"[NLPAR {label}] engine={NLPAR_ENGINE} SR={sr} lam={lam:.3f} aperture={ap_label} "
                   f"N_p={N_p}/{ph*pw} ({100.0*N_p/(ph*pw):.1f}%) "
-                  f"rows={int(n_avail)}/{self.nrows} chunk_budget={budget/1e9:.2f} GB "
+                  f"rows={n_avail}/{self.nrows} chunk_budget={budget/1e9:.2f} GB "
+                  f"sigma={'reused from Optimize Lambda' if sigma_reused else 'computed now'} "
                   f"source={'RAM' if from_ram else 'file'} -> {'RAM' if to_ram else out_path}")
+            finish = self._hook_nlpar_progress(nlobj, f"NLPAR batch ({label})", n_avail * int(self.ncols))
+            kw = dict(chunksize=budget, lam=float(lam), searchradius=int(sr),
+                      saturation_protect=True, automask=False, backsub=False)
             if to_ram:
-                nlobj.calcnlpar(chunksize=budget, saturation_protect=True, automask=False, backsub=False)
+                nlobj.calcnlpar(**kw)
+                finish()
                 elapsed = time.time() - t0
                 self.f_nlpar = RamUPFile(self.orig_path, self.nlpar_patterns)
                 self.nlpar_chk.setChecked(False)
-                self.nlpar_status.setText(f"NLPAR in RAM: SR={sr}, lam={lam:.2f} ({elapsed:.1f}s)")
-                self.statusBar().showMessage(f"NLPAR batch complete in RAM ({elapsed:.1f}s, N_p={N_p})")
+                self.nlpar_status.setText(f"NLPAR in RAM ({label}): SR={sr}, lam={lam:.2f} ({elapsed:.1f}s)")
+                self.statusBar().showMessage(f"NLPAR batch complete in RAM ({elapsed:.1f}s, {NLPAR_ENGINE}, N_p={N_p})")
+                print(f"[NLPAR {label}] done in {elapsed:.1f}s -> RAM")
                 self.update_display()
                 return
-            result_path = nlobj.calcnlpar(chunksize=budget, saturation_protect=True,
-                                          automask=False, backsub=False, fileout=out_path)
+            result_path = nlobj.calcnlpar(fileout=out_path, **kw)
+            finish()
             elapsed = time.time() - t0
             if not (result_path and os.path.isfile(result_path)):
                 base = os.path.splitext(self.orig_path)[0]
@@ -1993,15 +2158,19 @@ class MainWindow(QMainWindow):
                     self._temp_files.append(result_path)
                 self.f_nlpar = ebsd_pattern.get_pattern_file_obj(result_path)
                 self.nlpar_chk.setChecked(False)
-                self.nlpar_status.setText(f"CPU NLPAR: SR={sr}, lam={lam:.2f} ({elapsed:.1f}s)")
-                self.statusBar().showMessage(f"NLPAR batch complete ({elapsed:.1f}s, N_p={N_p})")
+                self.nlpar_status.setText(f"NLPAR ({label}): SR={sr}, lam={lam:.2f} ({elapsed:.1f}s)")
+                self.statusBar().showMessage(f"NLPAR batch complete ({elapsed:.1f}s, {NLPAR_ENGINE}, N_p={N_p})")
+                print(f"[NLPAR {label}] done in {elapsed:.1f}s -> {result_path}")
             else:
                 QMessageBox.warning(self, "Warning", "NLPAR ran but output not found.")
             self.update_display()
         except Exception as e:
             import traceback; traceback.print_exc()
-            self.statusBar().showMessage("NLPAR (CPU) failed")
-            QMessageBox.critical(self, "NLPAR (CPU) failed", str(e))
+            self.statusBar().showMessage(f"NLPAR ({NLPAR_ENGINE}) failed")
+            QMessageBox.critical(self, f"NLPAR ({NLPAR_ENGINE}) failed", str(e))
+
+    # Old name, still used by osc_selftest.py / osc_gpu_selftest.py (rewritten in Phase 4).
+    _apply_nlpar_cpu = _apply_nlpar_pyebsdindex
 
     def apply_and_save(self):
         """Save all processed patterns to a new UP1/UP2 file (chunked). The output keeps
