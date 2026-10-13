@@ -107,7 +107,10 @@ local/                    Git-ignored: your site-specific launch settings and no
 
 ## Requirements
 
-- **Windows** (only platform tested)
+- **Windows or Linux.** Developed on a Windows laptop; run on a Slurm cluster
+  through an OnDemand interactive desktop (see `LINUX_HPC_SETUP.md`). The
+  pyebsdindex OpenCL path of v1.6 has so far only been exercised on Windows;
+  on Linux it needs `pyopencl` plus the vendor OpenCL runtime (CUDA module)
 - **Python 3.11+** (developed on 3.14)
 - **NVIDIA GPU with CUDA** (optional — falls back to CPU paths if CuPy is not
   available, slower but functionally identical)
