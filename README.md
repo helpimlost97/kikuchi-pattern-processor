@@ -4,7 +4,7 @@ A GPU-accelerated GUI for viewing and processing EBSD / TKD / RKD Kikuchi patter
 files (EDAX UP1/UP2 format). Provides on-demand and full-dataset NPAR and NLPAR
 denoising, plus the standard pattern-processing pipeline (static / dynamic
 background, brightness, contrast, CLAHE), wrapped in a PyQt5 interface that runs
-sub-second previews on a laptop GPU and handles full-scan batch processing in
+sub-second previews on a GPU and handles full-scan batch processing in
 chunks sized to the available VRAM.
 
 ---
