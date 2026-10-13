@@ -188,8 +188,8 @@ This tool would not exist without the libraries it stands on:
 
 ## Author
 
-**N. Max Vega Michalak**
-PhD Candidate, Welding Engineering — The Ohio State University
+**N. Max Vega Michalak, PhD**
+Welding Engineering — The Ohio State University
 
 ---
 
