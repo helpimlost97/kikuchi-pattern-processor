@@ -6,6 +6,36 @@ was done, what was verified, and what is deliberately NOT done yet.
 `OSC_SETUP.md` (from the original repo) is still the general Linux/OSC guide;
 this file is the delta on top of it.
 
+## v1.5.0 (2026-10-10): UP2 / 16-bit support (uncommitted, not yet run on real data)
+
+Target dataset: `/fs/scratch/PAS2328/vegamichalak1/Scratch Downloads/FG10 TKD/FG TKD_FG10_Area 1_OIM Map 2.up2`
+(note: project **PAS2328** scratch, not PAS2325): v4 header (58 B), 363x291 = 105633 patterns,
+240x240 px uint16, data max ~40k (so the effective full scale is 65535), 12.2 GB. First real
+run 2026-10-10 on a 96-core / 475 GB CPU desktop (no GPU): load, Optimize Lambda, CPU NLPAR
+(SR 6) in RAM, Apply && Save with normalize + static background subtract -> complete, valid
+`..._NLPAR6_Norm_BackSub.up2`. Only visible symptom: a harmless Qt `XCB error: 3 (BadWindow)
+... TranslateCoords` line when the save dialog closed, plus a status bar frozen for the whole
+127-row chunk -> v1.5.1 adds in-chunk progress/ETA, flushes the dialog before the loop, and
+sizes CPU save chunks at 42 B/px instead of 18. The app
+already opened `.up2` files, but the processing chain assumed uint8: B/C centred on
+127.5, outputs clipped to 255 then written as uint16 (dark files), raw preview on a
+0-255 scale, and the NLPAR temp files / save dialog forced `.up1`, which pyebsdindex
+reads back as uint8. Changes in `gpu_pattern_viewer.py`:
+
+- `self.src_ext`, `self.dtype_max` (255/65535), `self.scale_max` (effective full scale:
+  255 for uint8; smallest 2^k-1 >= dataset max for uint16, so a 12-bit camera -> 4095),
+  `self.data_max` (printed at load, shown in the file label). Set in `load_path`.
+- Raw/absolute preview `vmax = scale_max`; absolute-mode B/C midpoint `scale_max/2`,
+  clip to `scale_max`; normalized/global-stretch export scales to `dtype_max`
+  (`process_pattern`, `_process_chunk_batch`, `_cpu_pipeline_subbatch`).
+- `_gpu_nlpar_result` / `_cpu_nlpar_result` temp files and the `_NLPAR*` glob use the
+  source extension; `Apply && Save` filters on it, forces it if the user types another
+  one, and refuses to overwrite the loaded source file.
+- `Load Existing NLPAR` checks grid, pattern size and dtype against the loaded file.
+- uint8 behaviour is unchanged (scale_max stays 255). Headless smoke test on synthetic
+  6x5 scans (uint16 12-bit-like and uint8): absolute-mode save is byte-identical to the
+  input, normalized save fills 0-65535 / 0-255, CPU NLPAR on .up2 keeps the 16-bit scale.
+
 ## Where things are
 
 | Path | What |

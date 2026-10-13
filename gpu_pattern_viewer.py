@@ -1,4 +1,4 @@
-__version__ = "1.4.0"   # shown in the window title; bump with each release (git tag v<version>)
+__version__ = "1.5.1"   # shown in the window title; bump with each release (git tag v<version>)
 import sys
 import os
 import glob
@@ -37,7 +37,7 @@ from pyebsdindex import ebsd_pattern, nlpar
 from scipy.ndimage import gaussian_filter
 from skimage.exposure import equalize_adapthist
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Console prints use σ/λ/—; when stdout is a pipe/file on Windows it defaults to
 # cp1252 and a bare print would raise UnicodeEncodeError mid-run. Degrade to '?'.
@@ -335,6 +335,21 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Kikuchi Pattern Processor v{__version__} " + ("(GPU Accelerated)" if HAS_GPU else f"(CPU Mode, {n_workers()} threads)")); self.setGeometry(100, 100, 1400, 900)
         self.orig_path = None; self.f_orig = self.f_nlpar = None
         self.nlpar_patterns = None        # in-RAM NLPAR batch result (v1.3.0)
+        # Bit depth (v1.5.0, UP2 support). pyebsdindex takes the pattern dtype from the
+        # file extension (.up1 = uint8, .up2 = uint16), so every output file must keep the
+        # source extension or it is read back with the wrong dtype.
+        #   src_ext   : '.up1' or '.up2' of the loaded file
+        #   dtype_max : largest value the file dtype can hold (255 / 65535); the
+        #               normalized ([0,1]-domain) export is scaled to this
+        #   scale_max : the intensity full scale the DATA actually uses. uint8 files are
+        #               always 255 (unchanged behaviour). A uint16 container often holds
+        #               12/14-bit camera data, so it is the smallest 2^k-1 >= the dataset
+        #               max (4095, 16383, 65535, ...). Raw/absolute preview range and the
+        #               brightness/contrast midpoint of the unnormalized path use this.
+        self.src_ext = '.up1'
+        self.dtype_max = 255
+        self.scale_max = 255.0
+        self.data_max = None
         # Tier 1 (2026-09-27): the raw dataset held in RAM as one (npat, ph, pw) array in
         # the file's native dtype, when it fits. Every whole-dataset pass then slices this
         # instead of re-streaming the file (each pass was a full 32 GB read from home NFS).
@@ -570,7 +585,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Global range p1: row {row_start + rows_to_read}/{n_avail_rows}")
             QApplication.processEvents()
         if not np.isfinite(gmin) or gmax <= gmin:
-            self.global_lo, self.global_hi = 0.0, 255.0
+            self.global_lo, self.global_hi = 0.0, float(self.scale_max)
             self._global_range_key = key
             return
 
@@ -611,7 +626,7 @@ class MainWindow(QMainWindow):
         Click around the IQ map and re-click this button to spot-check the mask
         against different regions."""
         if self.f_orig is None:
-            QMessageBox.warning(self, "Error", "Load a UP1 file first")
+            QMessageBox.warning(self, "Error", "Load a UP1/UP2 file first")
             return
         ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
         m, count, label = self._resolve_aperture_mask(ph, pw)
@@ -865,8 +880,9 @@ class MainWindow(QMainWindow):
         """CPU σ² estimation, vectorized per scan row and threaded across rows.
 
         Same quantity as before (min over the 8 neighbours of the aperture-weighted SSD,
-        divided by 2·N_p): patterns are uint8/uint16 so the float32 differences and their
-        squares are exact, and the sums accumulate in float64 as the old loop did. Each
+        divided by 2·N_p): patterns are uint8/uint16 so the float32 differences are exact
+        (their squares too for uint8; for uint16 they carry float32 rounding, ~1e-7
+        relative), and the sums accumulate in float64 as the old loop did. Each
         (row, neighbour offset) is one array op over all columns instead of a Python loop
         over patterns, and the rows of a chunk are spread over a thread pool (numpy
         releases the GIL in these ops)."""
@@ -1060,9 +1076,10 @@ class MainWindow(QMainWindow):
     def process_pattern(self, pat):
         """Single-pattern preview pipeline. Output range depends on normalize toggle:
           normalize on  → returns values in [0, 1]
-          normalize off → returns values in absolute uint8 scale [0, 255]
+          normalize off → returns values in absolute intensity [0, scale_max]
+                          (255 for uint8; the effective full scale for uint16, see __init__)
         The two output ranges are handled in update_display when picking display vmin/vmax,
-        and in apply_and_save / _process_chunk_batch when scaling to uint8 for the UP1 file.
+        and in apply_and_save / _process_chunk_batch when scaling to the file dtype.
         """
         if pat is None: return None
         p = pat.astype(np.float64)
@@ -1110,9 +1127,11 @@ class MainWindow(QMainWindow):
             p = np.clip(p, 0, 1)
             return p
         else:
-            # Preserve absolute intensity. B/C centered on the uint8 midpoint (127.5).
-            # bright slider [-100..100]/100 → bval is in [-1,1], scaled to ±255 here.
-            p = (p - 127.5) * (1.0 + cval) + 127.5 + bval * 255.0
+            # Preserve absolute intensity. B/C centered on the intensity midpoint
+            # (127.5 for uint8, scale_max/2 in general). bright slider [-100..100]/100 →
+            # bval is in [-1,1], scaled to ±scale_max here.
+            mid = 0.5 * self.scale_max
+            p = (p - mid) * (1.0 + cval) + mid + bval * self.scale_max
             if self.clahe_chk.isChecked():
                 # CLAHE requires [0,1]; temporarily scale per-pattern, apply, then
                 # map back to the same [pmin, pmax] absolute span we started with.
@@ -1124,16 +1143,19 @@ class MainWindow(QMainWindow):
                     p_scaled = np.clip((p - pmin) / (pmax - pmin), 0, 1)
                     p_scaled = equalize_adapthist(p_scaled, clip_limit=self.clahe_clip.value() / 1000.0)
                     p = p_scaled * (pmax - pmin) + pmin
-            p = np.clip(p, 0, 255)
+            p = np.clip(p, 0, self.scale_max)
             return p
 
     # ---- Batch processing (GPU-accelerated when available) ----
-    def _process_chunk_batch(self, chunk, mask_rows):
+    def _process_chunk_batch(self, chunk, mask_rows, progress=None):
         """Process a chunk of patterns in batch. chunk: (N, ph, pw) float64.
-        Returns processed chunk in float64, clipped to [0, 255] ready for uint8 write.
-        Mirrors process_pattern: when normalize is on, internal range is [0,1] and
-        we *255 at the end; when off, internal range stays in absolute uint8 scale
-        and we just clip."""
+        `progress(done, N)` (optional) is called from this thread while the chunk is
+        processed, so the caller can keep the status bar alive inside a long chunk.
+        Returns processed chunk in float64, clipped to the file's integer range, ready for
+        the uint8/uint16 write. Mirrors process_pattern: when normalize (or global stretch)
+        is on, internal range is [0,1] and we scale to the full dtype range (255 / 65535)
+        at the end; when off, internal range stays in absolute intensity and we clip to
+        scale_max."""
         N = chunk.shape[0]
         use_static = self.static_bg_chk.isChecked() and self.mean_pattern is not None
         use_dyn = self.dyn_bg_chk.isChecked()
@@ -1196,8 +1218,9 @@ class MainWindow(QMainWindow):
                 # B/C in [0,1] units
                 d = (d - 0.5) * (1.0 + cval) + 0.5 + bval
             else:
-                # Preserve absolute intensity. B/C centered on uint8 midpoint.
-                d = (d - cp.float32(127.5)) * (1.0 + cval) + cp.float32(127.5) + cp.float32(bval * 255.0)
+                # Preserve absolute intensity. B/C centered on the intensity midpoint.
+                mid = cp.float32(0.5 * self.scale_max)
+                d = (d - mid) * (1.0 + cval) + mid + cp.float32(bval * self.scale_max)
 
             # Transfer back to CPU
             result = cp.asnumpy(d).astype(np.float64)
@@ -1207,12 +1230,13 @@ class MainWindow(QMainWindow):
         else:
             # CPU: run the whole chain (background, stretch, CLAHE, final scale) on
             # sub-batches across a thread pool; see _cpu_pipeline_threaded.
-            result = self._cpu_pipeline_threaded(chunk, mask_rows,
+            result = self._cpu_pipeline_threaded(chunk, mask_rows, progress=progress,
                 use_static=use_static, bg_subtract=(self.bg_mode.currentText() == "Subtract"),
                 use_dyn=use_dyn, use_clahe=use_clahe, normalize=normalize,
                 global_stretch=global_stretch, unit_domain=unit_domain, sigma=sigma,
                 bval=bval, cval=cval, clip_limit=clip_limit, ap_bool=ap_bool,
-                g_lo=(g_lo if global_stretch else None), g_hi=(g_hi if global_stretch else None))
+                g_lo=(g_lo if global_stretch else None), g_hi=(g_hi if global_stretch else None),
+                scale_max=float(self.scale_max), dtype_max=float(self.dtype_max))
             result[~mask_rows] = 0.0
             return result
 
@@ -1221,7 +1245,10 @@ class MainWindow(QMainWindow):
         # When off, we temporarily scale per-pattern to [0,1] for CLAHE then map
         # back to the original [pmin, pmax] span to preserve absolute intensity.
         if use_clahe:
+            last = time.time()
             for i in range(N):
+                if progress is not None and time.time() - last > 0.5:
+                    progress(i, N); last = time.time()
                 if not mask_rows[i]:
                     continue
                 if unit_domain:
@@ -1236,13 +1263,14 @@ class MainWindow(QMainWindow):
                         p_scaled = equalize_adapthist(p_scaled, clip_limit=clip_limit)
                         result[i] = p_scaled * (pmax_i - pmin_i) + pmin_i
 
-        # Final scale to [0, 255]. When in unit domain (per-pattern normalize OR
-        # global stretch), data is in [0,1] so *255 first; when off, data is already
-        # in absolute uint8 scale so just clip.
+        # Final scale to the file's integer range. When in unit domain (per-pattern
+        # normalize OR global stretch), data is in [0,1] so scale to the full dtype range
+        # (255 for .up1, 65535 for .up2) first; when off, data is already in absolute
+        # intensity so just clip to the effective full scale.
         if unit_domain:
-            result = np.clip(result * 255.0, 0, 255)
+            result = np.clip(result * float(self.dtype_max), 0, self.dtype_max)
         else:
-            result = np.clip(result, 0, 255)
+            result = np.clip(result, 0, self.scale_max)
         # [MVM 2026-09-08] The aperture is deliberately NOT re-asserted here. It is a
         # statistics gate only (min/max, global stretch bounds, CLAHE source range,
         # N_p in NLPAR); masked pixels keep their own processed values and reach disk
@@ -1253,8 +1281,9 @@ class MainWindow(QMainWindow):
 
     def _cpu_pipeline_subbatch(self, sub, mask_sub, use_static, bg_subtract, use_dyn, use_clahe,
                                normalize, global_stretch, unit_domain, sigma, bval, cval,
-                               clip_limit, ap_bool, g_lo, g_hi):
-        """CPU processing chain for one sub-batch (n, ph, pw) float64 -> float64 in [0,255].
+                               clip_limit, ap_bool, g_lo, g_hi, scale_max=255.0, dtype_max=255.0):
+        """CPU processing chain for one sub-batch (n, ph, pw) float64 -> float64 in
+        [0, dtype_max] (unit domain) or [0, scale_max] (absolute intensity).
         This is the original CPU fallback of _process_chunk_batch plus its CLAHE loop and
         final scaling, unchanged in the math, split out so several copies can run at once.
         No Qt widget access in here: everything UI-derived arrives as an argument."""
@@ -1286,7 +1315,8 @@ class MainWindow(QMainWindow):
             result = np.where(valid, (result - pmin) / np.where(valid, spread, np.ones_like(spread)), result)
             result = (result - 0.5) * (1.0 + cval) + 0.5 + bval
         else:
-            result = (result - 127.5) * (1.0 + cval) + 127.5 + bval * 255.0
+            mid = 0.5 * scale_max
+            result = (result - mid) * (1.0 + cval) + mid + bval * scale_max
         if use_clahe:
             for i in range(n):
                 if not mask_sub[i]:
@@ -1302,16 +1332,19 @@ class MainWindow(QMainWindow):
                         p_scaled = equalize_adapthist(p_scaled, clip_limit=clip_limit)
                         result[i] = p_scaled * (pmax_i - pmin_i) + pmin_i
         if unit_domain:
-            result = np.clip(result * 255.0, 0, 255)
+            result = np.clip(result * dtype_max, 0, dtype_max)
         else:
-            result = np.clip(result, 0, 255)
+            result = np.clip(result, 0, scale_max)
         return result
 
-    def _cpu_pipeline_threaded(self, chunk, mask_rows, **kw):
+    def _cpu_pipeline_threaded(self, chunk, mask_rows, progress=None, **kw):
         """Split a chunk into ~3 sub-batches per worker thread and run _cpu_pipeline_subbatch
         on each in a thread pool. scipy.ndimage, the big numpy reductions and most of
         skimage's CLAHE release the GIL, so this scales across the cores SLURM gave us
-        (n_workers). Output is assembled into one float64 array of the chunk's shape."""
+        (n_workers). Output is assembled into one float64 array of the chunk's shape.
+        `progress(done_patterns, N)` is called from the CALLING thread as sub-batches
+        finish (safe to touch Qt from it): a 127-row chunk of the FG10 TKD scan took
+        minutes with no status-bar change, which looked like a hang (2026-10-10)."""
         N = chunk.shape[0]
         nthr = max(1, min(n_workers(), N))
         nsub = max(1, min(N, nthr * 3))
@@ -1321,8 +1354,18 @@ class MainWindow(QMainWindow):
             i0, i1 = int(bounds[k]), int(bounds[k + 1])
             if i1 > i0:
                 out[i0:i1] = self._cpu_pipeline_subbatch(chunk[i0:i1], mask_rows[i0:i1], **kw)
+            return i1 - i0
         with ThreadPoolExecutor(max_workers=nthr) as pool:
-            list(pool.map(work, range(nsub)))
+            futs = [pool.submit(work, k) for k in range(nsub)]
+            if progress is None:
+                for f in futs: f.result()
+            else:
+                done = 0; last = 0.0
+                for f in as_completed(futs):
+                    done += f.result()
+                    if time.time() - last > 0.5:
+                        progress(done, N); last = time.time()
+                progress(N, N)
         return out
 
     # ---- Display ----
@@ -1333,11 +1376,12 @@ class MainWindow(QMainWindow):
     def update_display(self):
         if self.f_orig is None: return
         orig = self._read_pattern(self.f_orig)
-        # Raw panel: true absolute uint8 scale (vmin=0, vmax=255). Patterns with
-        # weaker raw signal will visibly look dimmer, instead of being silently
-        # stretched to fill the colormap by matplotlib's auto-normalize.
+        # Raw panel: true absolute scale (vmin=0, vmax=scale_max: 255 for uint8, the
+        # effective full scale for uint16). Patterns with weaker raw signal will visibly
+        # look dimmer, instead of being silently stretched to fill the colormap by
+        # matplotlib's auto-normalize.
         self.raw_canvas.show_pattern(orig, f"Original [{self.current_col}, {self.current_row}]",
-                                     vmin=0, vmax=255)
+                                     vmin=0, vmax=self.scale_max)
         if self.current_row >= self.nrows or self.current_col >= self.ncols: return  # stale click from a larger scan
         if self.iq_mask is not None and not self.iq_mask[self.current_row, self.current_col]:
             self.proc_canvas.show_pattern(None, "Excluded by IQ range"); return
@@ -1352,22 +1396,22 @@ class MainWindow(QMainWindow):
         elif self.npar_chk.isChecked(): src = "NPAR+"
         # Proc display range follows the normalize toggle:
         #   normalize on  → output is in [0,1]  → fixed_range=True
-        #   normalize off → output is in absolute uint8 scale → vmin=0, vmax=255
-        # Using vmin=0,vmax=255 in the unnormalized case matches what apply_and_save
-        # actually writes to the UP1, so the preview is honest about the export.
+        #   normalize off → output is in absolute intensity → vmin=0, vmax=scale_max
+        # Using vmin=0,vmax=scale_max in the unnormalized case matches what apply_and_save
+        # actually writes to the file, so the preview is honest about the export.
         if self.normalize_chk.isChecked() or self.global_chk.isChecked():
             self.proc_canvas.show_pattern(processed,
                 f"{src}Processed [{self.current_col}, {self.current_row}]", fixed_range=True)
         else:
             self.proc_canvas.show_pattern(processed,
                 f"{src}Processed [{self.current_col}, {self.current_row}]",
-                vmin=0, vmax=255)
+                vmin=0, vmax=self.scale_max)
         self.statusBar().showMessage(f"Pattern processed in {elapsed*1000:.0f} ms")
 
     # ---- File loading ----
     def load_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open UP1 File",
-            "", "UP1 Files (*.up1 *.up2)")
+        path, _ = QFileDialog.getOpenFileName(self, "Open UP1/UP2 File",
+            "", "UP1/UP2 Files (*.up1 *.up2)")
         if not path: return
         self.load_path(path)
 
@@ -1394,7 +1438,10 @@ class MainWindow(QMainWindow):
         ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
         # Check for truncated file but KEEP original header dimensions for OIM compat
         fsize = int(os.path.getsize(path))
-        bpp = 2 if path.lower().endswith('.up2') else 1
+        bpp = int(np.dtype(self.f_orig.filedatatype).itemsize)   # 1 (.up1) or 2 (.up2)
+        self.src_ext = os.path.splitext(path)[1].lower()
+        self.dtype_max = int(np.iinfo(self.f_orig.filedatatype).max)
+        self.scale_max = float(self.dtype_max); self.data_max = None
         header_bytes = int(getattr(self.f_orig, 'filePos', 42) or 0)  # real data offset (42 for v3, more for v4)
         self.n_actual_pats = int((fsize - header_bytes) // (ph * pw * bpp))
         self.n_actual_rows = self.n_actual_pats // self.ncols
@@ -1454,12 +1501,15 @@ class MainWindow(QMainWindow):
         nthr = int(max(1, min(n_workers(), (0.25 * available_ram()) // (2 * row_bytes_f32))))
         print(f"[LOAD] {nthr} threads")
 
+        data_max = 0
+
         def slice_stats(sl):
             cf = sl.astype(np.float32)
             iq = cf.std(axis=(1, 2))
             s1 = sl.sum(axis=0, dtype=np.float64)
             s2 = np.square(cf).sum(axis=0, dtype=np.float64)
-            return iq, s1, s2
+            mx = int(sl.max()) if sl.size else 0      # dataset max -> effective bit depth
+            return iq, s1, s2, mx
 
         with ThreadPoolExecutor(max_workers=nthr) as pool:
             for row_start in range(0, self.n_actual_rows, CHUNK_ROWS):
@@ -1468,10 +1518,11 @@ class MainWindow(QMainWindow):
                 n = chunk.shape[0]
                 bounds = np.linspace(0, n, min(nthr, n) + 1, dtype=int)
                 slices = [chunk[a:b] for a, b in zip(bounds[:-1], bounds[1:]) if b > a]
-                for iq, s1, s2 in pool.map(slice_stats, slices):
+                for iq, s1, s2, mx in pool.map(slice_stats, slices):
                     iq_values.append(iq)
                     mean_accum += s1
                     sumsq_accum += s2
+                    data_max = max(data_max, mx)
                 total_pats += n
                 self.statusBar().showMessage(f"Loading: row {row_start + rows_to_read}/{self.nrows}")
                 QApplication.processEvents()
@@ -1485,7 +1536,20 @@ class MainWindow(QMainWindow):
         # Per-pixel std: sqrt(E[X^2] - E[X]^2). max(.,0) guards against tiny negative values from FP precision.
         mean_sq = sumsq_accum / max(total_pats, 1)
         self.pixel_std = np.sqrt(np.maximum(mean_sq - self.mean_pattern ** 2, 0.0))
-        self.file_label.setText(f"{os.path.basename(path)}\n{self.ncols} x {self.nrows} = {self.ncols*self.nrows} patterns ({self.mem_mode})")
+        # Intensity full scale (see __init__): uint8 stays 255; a uint16 file gets the
+        # smallest 2^k-1 that holds its data (a 12-bit camera in a .up2 -> 4095), so the
+        # raw/absolute preview and the B/C midpoint track the signal, not the container.
+        self.data_max = int(data_max)
+        if self.dtype_max > 255:
+            bits = max(8, int(np.ceil(np.log2(self.data_max + 1)))) if self.data_max > 0 else 8
+            self.scale_max = float(min((1 << bits) - 1, self.dtype_max))
+        else:
+            self.scale_max = 255.0
+        print(f"[LOAD] {np.dtype(self.f_orig.filedatatype).name} patterns ({self.src_ext}): "
+              f"data max = {self.data_max}, intensity full scale = {int(self.scale_max)} "
+              f"(dtype max {self.dtype_max})")
+        self.file_label.setText(f"{os.path.basename(path)}\n{self.ncols} x {self.nrows} = {self.ncols*self.nrows} patterns ({self.mem_mode})"
+                                f"\n{8 * bpp}-bit ({self.src_ext}), data max {self.data_max}, scale 0-{int(self.scale_max)}")
         self.bg_status.setText("Background: all patterns")
         self.scan_canvas.set_map(self.iq_map, self.nrows, self.ncols)
         self.iq_mask = np.ones((self.nrows, self.ncols), dtype=bool)
@@ -1493,16 +1557,30 @@ class MainWindow(QMainWindow):
         self.on_pattern_clicked(0, 0); self.statusBar().showMessage("Ready")
 
     def load_nlpar_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open NLPAR UP1 File",
-            "", "UP1 Files (*.up1 *.up2)")
+        if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1/UP2 file first"); return
+        path, _ = QFileDialog.getOpenFileName(self, "Open NLPAR UP1/UP2 File",
+            os.path.dirname(self.orig_path), "UP1/UP2 Files (*.up1 *.up2)")
         if not path: return
+        f_new = ebsd_pattern.get_pattern_file_obj(path)
+        # The NLPAR file stands in for the original in every pass, so it must have the
+        # same grid, pattern size and bit depth (a .up1 next to a .up2 source is uint8).
+        same = (int(f_new.patternH) == int(self.f_orig.patternH) and int(f_new.patternW) == int(self.f_orig.patternW)
+                and int(f_new.nCols) == int(self.ncols) and int(f_new.nRows) == int(self.nrows)
+                and np.dtype(f_new.filedatatype) == np.dtype(self.f_orig.filedatatype))
+        if not same:
+            QMessageBox.warning(self, "NLPAR file does not match",
+                f"{os.path.basename(path)} is {int(f_new.nCols)}x{int(f_new.nRows)} scan points of "
+                f"{int(f_new.patternW)}x{int(f_new.patternH)} px, {np.dtype(f_new.filedatatype).name};\n"
+                f"the loaded dataset is {self.ncols}x{self.nrows} of "
+                f"{int(self.f_orig.patternW)}x{int(self.f_orig.patternH)} px, {np.dtype(self.f_orig.filedatatype).name}.")
+            return
         self.nlpar_patterns = None       # a file replaces any in-RAM result
-        self.f_nlpar = ebsd_pattern.get_pattern_file_obj(path)
+        self.f_nlpar = f_new
         self.nlpar_chk.setChecked(False)  # disable on-demand since we have a file
         self.nlpar_status.setText(f"Loaded: {os.path.basename(path)}"); self.update_display()
 
     def recompute_background(self):
-        if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1 file first"); return
+        if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1/UP2 file first"); return
         mask = self._get_iq_mask()
         n_valid = int(mask.sum())
         if n_valid == 0: QMessageBox.warning(self, "Error", "No patterns in IQ range"); return
@@ -1561,7 +1639,7 @@ class MainWindow(QMainWindow):
           viewer uses. automask is now False; for mode "Circular (EBSD)" the aperture we
           hand over IS makeautomask, so that case is unchanged.
         """
-        if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1 file first"); return
+        if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1/UP2 file first"); return
         try:
             sr = self.sr_spin.value()
             ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
@@ -1600,7 +1678,7 @@ class MainWindow(QMainWindow):
 
     def apply_nlpar_batch(self):
         """Run NLPAR on the full dataset. Uses GPU shift-and-compare when available, else pyebsdindex CPU."""
-        if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1 file first"); return
+        if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1/UP2 file first"); return
         if not self._lambda_optimized:
             QMessageBox.information(self, "Optimize lambda first",
                 "Need to optimize lambda before applying NLPAR to the full dataset.\n\n"
@@ -1664,7 +1742,7 @@ class MainWindow(QMainWindow):
         if not to_ram:
             # Output file setup
             tmp_dir = os.path.dirname(self.orig_path)
-            out_path = os.path.join(tmp_dir, "_gpu_nlpar_result.up1")
+            out_path = os.path.join(tmp_dir, "_gpu_nlpar_result" + self.src_ext)   # .up1/.up2 = dtype
             # Create the file ourselves: source header verbatim + sparse truncate to the
             # number of patterns the source actually has. Letting pyebsdindex create it
             # pre-fills every pattern with zeros one tofile() at a time (see apply_and_save).
@@ -1674,7 +1752,7 @@ class MainWindow(QMainWindow):
             with open(out_path, 'wb') as f_dst:
                 f_dst.write(hdr)
                 f_dst.truncate(hdr_len + int(getattr(self, 'n_actual_pats', self.nrows * self.ncols)) * ph * pw
-                               * (2 if self.orig_path.lower().endswith('.up2') else 1))
+                               * int(np.dtype(self.f_orig.filedatatype).itemsize))
             out_obj = ebsd_pattern.get_pattern_file_obj(out_path)
 
         # Adaptive chunk size based on VRAM and pattern dimensions
@@ -1881,7 +1959,7 @@ class MainWindow(QMainWindow):
             else:
                 N_p = ph * pw
                 ap_label = "None"
-            out_path = os.path.join(os.path.dirname(self.orig_path), "_cpu_nlpar_result.up1")
+            out_path = os.path.join(os.path.dirname(self.orig_path), "_cpu_nlpar_result" + self.src_ext)
             budget = self._nlpar_chunk_bytes()
             print(f"[CPU NLPAR] SR={sr} lam={lam:.3f} aperture={ap_label} "
                   f"N_p={N_p}/{ph*pw} ({100.0*N_p/(ph*pw):.1f}%) "
@@ -1901,7 +1979,7 @@ class MainWindow(QMainWindow):
             elapsed = time.time() - t0
             if not (result_path and os.path.isfile(result_path)):
                 base = os.path.splitext(self.orig_path)[0]
-                candidates = sorted(glob.glob(f"{base}_NLPAR*.up1"), key=os.path.getmtime, reverse=True)
+                candidates = sorted(glob.glob(f"{base}_NLPAR*{self.src_ext}"), key=os.path.getmtime, reverse=True)
                 result_path = candidates[0] if candidates else None
             if result_path and os.path.isfile(result_path):
                 if result_path not in self._temp_files:
@@ -1919,18 +1997,33 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "NLPAR (CPU) failed", str(e))
 
     def apply_and_save(self):
-        """Save all processed patterns to a new UP1 file (chunked)."""
-        if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1 file first"); return
+        """Save all processed patterns to a new UP1/UP2 file (chunked). The output keeps
+        the source's extension and bit depth: pyebsdindex (and OIM) take the dtype from
+        the extension, so a .up2 source is always written as a .up2."""
+        if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1/UP2 file first"); return
         if self.nlpar_chk.isChecked() and self.f_nlpar is None:
             QMessageBox.information(self, "NLPAR not applied to full dataset",
                 "Need to apply NLPAR to the full dataset before saving.\n\n"
                 "Click 'Apply NLPAR to Full Dataset', wait for it to finish, then "
                 "click 'Apply && Save' again.")
             return
+        ext = self.src_ext
         path, _ = QFileDialog.getSaveFileName(self, "Save Processed Patterns",
-            os.path.dirname(self.orig_path), "UP1 Files (*.up1)")
+            os.path.dirname(self.orig_path), f"{ext[1:].upper()} Files (*{ext})")
         if not path: return
         path = os.path.abspath(path)
+        if os.path.splitext(path)[1].lower() != ext:
+            # A different extension would change the bit depth the file is read with.
+            path = os.path.splitext(path)[0] + ext
+            print(f"[SAVE] output extension forced to {ext} (same bit depth as the source)")
+        if os.path.exists(path) and os.path.samefile(path, self.orig_path):
+            QMessageBox.warning(self, "Error", "Cannot overwrite the loaded source file. Choose another name.")
+            return
+        # Let the file dialog finish tearing down before the main thread goes busy.
+        # Otherwise its deferred X11 events are handled mid-save and the xcb backend logs
+        # "XCB error: 3 (BadWindow) ... TranslateCoords" for the already-destroyed dialog
+        # window. Harmless, but it reads like a failure (Max, 2026-10-10).
+        for _ in range(3): QApplication.processEvents()
         self.statusBar().showMessage(f"Processing all patterns ({'GPU' if HAS_GPU else 'CPU'})..."); QApplication.processEvents()
         t0 = time.time()
         mask = self._get_iq_mask()
@@ -1961,7 +2054,10 @@ class MainWindow(QMainWindow):
         # VRAM is only half the story: the chunk also lives in host RAM as the native read
         # (1–2 B/px) + the float64 cast the batch function needs (8) + the float64 result (8)
         # + write-side uint8/uint16 conversion (~1) ≈ 18. Cap by whichever is tighter.
-        CHUNK_ROWS = min(CHUNK_ROWS, self._host_chunk_rows(18))
+        # The CPU path holds more at its peak: on top of those, _cpu_pipeline_threaded's
+        # float64 `out` (8), each sub-batch's `result = sub.copy()` (8 over the chunk) and
+        # the np.where / gaussian_filter temporaries (~8-16) ≈ 42 B/px (2026-10-10).
+        CHUNK_ROWS = min(CHUNK_ROWS, self._host_chunk_rows(18 if HAS_GPU else 42))
         # ---- Output size: exactly the patterns the source has (2026-09-28) ----
         # A map that was stopped early has fewer patterns in the .up1 than nCols*nRows
         # in its header (OIM writes it that way). The header keeps the full grid so OIM
@@ -1982,7 +2078,7 @@ class MainWindow(QMainWindow):
         # Copy the source header verbatim (same grid, version, steps, v4 extra bytes) and
         # reserve the final size with a sparse truncate (milliseconds); the chunk writes
         # below then fill it in place.
-        ph_bytes = ph * pw * (2 if self.orig_path.lower().endswith('.up2') else 1)
+        ph_bytes = ph * pw * int(np.dtype(self.f_orig.filedatatype).itemsize)
         hdr_len = int(self.f_orig.filePos)
         with open(self.orig_path, 'rb') as f_src:
             hdr = f_src.read(hdr_len)
@@ -2011,10 +2107,22 @@ class MainWindow(QMainWindow):
                 del parts
             mask_rows = mask_flat[p0:p1]
             # Batch process entire chunk (GPU-accelerated if available); it expects float64.
-            chunk = self._process_chunk_batch(chunk.astype(np.float64), mask_rows)
+            # In-chunk progress: patterns done in this chunk -> rows done overall + ETA.
+            def chunk_progress(done, n_in_chunk, _r0=row_start, _p0=p0):
+                frac_rows = _r0 + rows_to_read * (done / max(n_in_chunk, 1))
+                el = time.time() - t0
+                eta = el / max(frac_rows, 1e-9) * (n_rows_out - frac_rows) if frac_rows > 0 else 0.0
+                self.statusBar().showMessage(
+                    f"Saving: processing row {frac_rows:.0f}/{n_rows_out} "
+                    f"({100.0 * frac_rows / n_rows_out:.0f}%, {el:.0f}s elapsed, ETA {eta:.0f}s)")
+                QApplication.processEvents()
+            chunk = self._process_chunk_batch(chunk.astype(np.float64), mask_rows, progress=chunk_progress)
             n_saved += int(mask_rows.sum())
+            self.statusBar().showMessage(f"Saving: writing rows {row_start + 1}-{row_start + rows_to_read} of {n_rows_out} to disk...")
+            QApplication.processEvents()
             out_obj.write_data(newpatterns=chunk, patStartCount=[p0, -1], writeHead=False)
             del chunk
+            print(f"[SAVE] rows {row_start + rows_to_read}/{n_rows_out} done ({time.time() - t0:.0f}s)")
             self.statusBar().showMessage(f"Saving: row {row_start + rows_to_read}/{n_rows_out}")
             QApplication.processEvents()
         elapsed = time.time() - t0
@@ -2085,7 +2193,7 @@ class MainWindow(QMainWindow):
         # File
         g = QGroupBox("File"); gl = QVBoxLayout(g)
         self.file_label = QLabel("No file loaded"); self.file_label.setWordWrap(True)
-        btn = QPushButton("Load UP1"); btn.clicked.connect(self.load_file)
+        btn = QPushButton("Load UP1 / UP2"); btn.clicked.connect(self.load_file)
         gl.addWidget(self.file_label); gl.addWidget(btn); cl.addWidget(g)
 
         # Aperture mask — GLOBAL gate, applied before every other operation.
@@ -2145,7 +2253,7 @@ class MainWindow(QMainWindow):
         gl.addRow("Search Radius:", self.sr_spin); gl.addRow("Lambda:", self.lam_spin)
         b1 = QPushButton("Optimize Lambda"); b1.clicked.connect(self.optimize_lambda)
         b2 = QPushButton("Apply NLPAR to Full Dataset (GPU)" if HAS_GPU else "Apply NLPAR to Full Dataset (CPU)"); b2.clicked.connect(self.apply_nlpar_batch)
-        b3 = QPushButton("Load Existing NLPAR UP1"); b3.clicked.connect(self.load_nlpar_file)
+        b3 = QPushButton("Load Existing NLPAR UP1/UP2"); b3.clicked.connect(self.load_nlpar_file)
         gl.addRow(b1); gl.addRow(b2); gl.addRow(b3)
         self.nlpar_status = QLabel("No NLPAR file loaded"); gl.addRow(self.nlpar_status); cl.addWidget(g)
 
@@ -2175,15 +2283,15 @@ class MainWindow(QMainWindow):
         # When ON  (default): every pattern is independently stretched to fill the
         #   display range. Equalizes the visual appearance across the scan but
         #   hides absolute intensity differences (e.g. detector gain drift).
-        # When OFF: absolute uint8 intensity is preserved end-to-end (preview AND
-        #   exported UP1). Dim patterns look dim. Use this if you want the saved
+        # When OFF: absolute intensity (native bit depth) is preserved end-to-end (preview
+        #   AND exported UP1/UP2). Dim patterns look dim. Use this if you want the saved
         #   patterns to reflect the actual signal level recorded by the detector.
         g = QGroupBox("Normalization"); gl = QVBoxLayout(g)
         self.normalize_chk = QCheckBox("Per-pattern stretch to [0,1]")
         self.normalize_chk.setChecked(True)
         self.normalize_chk.setToolTip(
             "ON: each pattern independently stretched to fill the display range.\n"
-            "OFF: absolute uint8 intensity preserved in preview AND exported UP1.\n"
+            "OFF: absolute intensity (native 8/16-bit scale) preserved in preview AND exported file.\n"
             "Turn OFF to see real intensity differences across the scan (e.g. detector gain steps)."
         )
         self.normalize_chk.stateChanged.connect(self.update_display)

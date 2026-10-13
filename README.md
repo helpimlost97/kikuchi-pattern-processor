@@ -26,6 +26,13 @@ turned out to be useful enough to publish.
 
 - Loads EDAX **UP1 / UP2** pattern files (v3 and v4 headers, hex-grid flag
   preserved end-to-end for OIM round-trip compatibility)
+- **8-bit and 16-bit patterns** (v1.5.0): a `.up2` is processed as uint16 all the
+  way through. The raw/absolute-intensity preview and the brightness/contrast
+  midpoint use the data's effective full scale (255 for `.up1`; for `.up2` the
+  smallest 2^k-1 that holds the dataset max, e.g. 4095 for a 12-bit camera),
+  the normalized export fills the full dtype range (255 / 65535), and every
+  output (NLPAR temp files, `Apply && Save`) keeps the source extension
+  because pyebsdindex and OIM take the bit depth from it.
 - Interactive **IQ map** with click-to-preview, Ctrl + scroll zoom, dual-slider
   IQ range filtering, semi-transparent mask overlay for excluded patterns
 - **NLPAR** using the canonical Brewick et al. 2019 formulation with
@@ -50,7 +57,7 @@ turned out to be useful enough to publish.
   per-pattern min-max normalize → brightness / contrast → CLAHE → clip. The
   full-dataset version (`Apply && Save`) batches the chain on GPU with chunked
   CuPy ops.
-- **OIM-compatible UP1 output**: pyebsdindex's `write_data` only emits the
+- **OIM-compatible UP1/UP2 output**: pyebsdindex's `write_data` only emits the
   42-byte standard header, but v4 UP1 files have additional bytes between byte
   42 and `filePos`. This tool copies those bytes verbatim from the source file
   after the first write, so the output round-trips cleanly through OIM Analysis.
