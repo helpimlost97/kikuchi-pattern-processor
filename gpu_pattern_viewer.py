@@ -1,4 +1,4 @@
-__version__ = "1.6.0.dev4"   # shown in the window title; bump with each release (git tag v<version>)
+__version__ = "1.6.0.dev5"   # shown in the window title; bump with each release (git tag v<version>)
 import sys
 import os
 import glob
@@ -70,7 +70,12 @@ def _patch_pyebsdindex_nlpar_kernel():
         text = open(src, encoding='utf-8').read()
         sha = hashlib.sha1(text.encode('utf-8')).hexdigest()
         full = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'patches', 'clnlpar_fixed.cl')
-        kdir = os.path.join(tempfile.gettempdir(), 'kikuchi_pattern_processor')
+        # Per-user cache dir: the system temp dir is shared on a cluster node and a
+        # directory created there by another user is not writable (code review 2026-10-13).
+        import getpass
+        try: user = getpass.getuser()
+        except Exception: user = 'user'
+        kdir = os.path.join(tempfile.gettempdir(), f'kikuchi_pattern_processor_{user}')
         if sha in _KNOWN_SHIPPED_CLNLPAR and os.path.isfile(full):
             dst, level = full, 'full'            # known 0.3.9.x file: use our complete fixed copy
         else:
@@ -408,14 +413,17 @@ class RamUPFile(ebsd_pattern.UPFile):
 
     def _apply_exclude(self, pats, idx):
         """Phase 3 IQ-range exclusion without touching pyebsdindex: excluded patterns are
-        served as all-zero patterns. Together with sigma = 0 at those positions (set by the
-        batch) their normalised distance to any real pattern is enormous, so their weight
-        is exp(-huge) = 0: they are dropped as neighbours. Their own output is the zero
-        pattern, which the batch zeroes anyway. See PLAN_NLPAR_PYEBSDINDEX.md, Phase 3."""
+        served as a constant pattern of value 1. Together with sigma = 0 at those positions
+        (set by the batch) their normalised distance to any real pattern is enormous, so
+        their weight is exp(-huge) = 0: they are dropped as neighbours. Their own output is
+        that constant pattern, which the batch overwrites with zeros. Value 1 rather than 0:
+        pyebsdindex's calcnlpar_cl treats an all-zero output pattern as the Apple-silicon
+        GPU failure and recomputes the tile up to three times (code review 2026-10-13).
+        See PLAN_NLPAR_PYEBSDINDEX.md, Phase 3."""
         if self.exclude is not None:
             sel = self.exclude[idx]
             if sel.any():
-                pats[sel] = 0
+                pats[sel] = 1
         return pats
 
     def _xyloc(self, idx):
@@ -473,21 +481,16 @@ class MaskedUPFile(ebsd_pattern.UPFile):
                                 patStartCount=patStartCount, returnArrayOnly=returnArrayOnly)
         if not returnArrayOnly or self.exclude is None:
             return out
-        pats, xyloc = out
         psc = np.asarray(patStartCount, dtype=np.int64)
-        ncols, nrows = int(self.nCols), int(self.nRows)
-        if psc.ndim == 1:
-            p0 = int(psc[0]); idx = np.arange(p0, p0 + pats.shape[0], dtype=np.int64)
-        else:
-            c0, nc = int(psc[0, 0]), int(psc[1, 0]); r0, nr = int(psc[0, 1]), int(psc[1, 1])
-            if nc < 0: nc = ncols - c0
-            if nr < 0: nr = nrows - r0
-            nc = min(nc, ncols - c0); nr = min(nr, nrows - r0)
-            idx = (np.arange(r0, r0 + nr, dtype=np.int64)[:, None] * ncols
-                   + np.arange(c0, c0 + nc, dtype=np.int64)[None, :]).ravel()[:pats.shape[0]]
+        if psc.ndim != 1:
+            # Slab read: UPFile.read_data assembles it from one self.read_data call per
+            # row, each of which already passed through this branch. Nothing left to do.
+            return out
+        pats, xyloc = out
+        p0 = int(psc[0]); idx = np.arange(p0, p0 + pats.shape[0], dtype=np.int64)
         sel = self.exclude[idx]
         if sel.any():
-            pats = np.array(pats, copy=True); pats[sel] = 0
+            pats[sel] = 1                        # fresh array from pat_reader: in place is safe
         return pats, xyloc
 
 
@@ -539,6 +542,10 @@ class MainWindow(QMainWindow):
         # keyed on (path, aperture, rows). See _get_nlobj.
         self._nlobj = None; self._nlobj_key = None; self._nlobj_from_ram = False
         self._nl_infile = None               # the object's input file (RamUPFile / MaskedUPFile)
+        # True while a pyebsdindex call is in flight. The progress hook pumps the Qt event
+        # loop, so button clicks and control changes arrive mid-call; the entry points
+        # refuse while busy instead of re-entering on the same object (code review 2026-10-13).
+        self._nlpar_busy = False
         self.nrows = self.ncols = self.current_row = self.current_col = 0
         self.mean_pattern = None; self.iq_map = None; self.iq_mask = None
         self.pixel_std = None  # per-pixel std across dataset, for variance-based aperture detection
@@ -618,6 +625,9 @@ class MainWindow(QMainWindow):
         """Aperture is a global gate: it changes N_p (NLPAR), the σ² estimate, the
         global-stretch percentile population, and which pixels survive to the output.
         Every cache that depends on it must be dropped and the preview refreshed."""
+        if self._nlpar_busy:
+            self.statusBar().showMessage("NLPAR is running: aperture change ignored until it finishes")
+            return
         self._invalidate_sigma_map()
         self._invalidate_global_range()
         self._lambda_optimized = False  # lambda was fitted for the previous aperture
@@ -891,6 +901,9 @@ class MainWindow(QMainWindow):
         self._ensure_sigma_map()
         pats, mask, cr, cc = self._read_neighborhood(self.f_orig, row, col, sr)
         center_pat = pats[cr, cc].astype(np.float64)
+        if self.sigma_sq_map is None:
+            return center_pat                    # sigma unavailable while a batch is running
+        on_gpu = self._nlpar_engine_of(self._nlobj)[0] if self._nlobj is not None else NLPAR_ON_GPU
         ph, pw = center_pat.shape
         nr, nc = pats.shape[0], pats.shape[1]
 
@@ -901,7 +914,7 @@ class MainWindow(QMainWindow):
         # off -> threshold above any value (pyebsdindex uses max+1). dthresh as in the kernels.
         params = self._nlpar_params()
         data_max = float(self.data_max) if getattr(self, 'data_max', None) else float(np.max(pats))
-        sat_thresh = data_max * (0.9961 if NLPAR_ON_GPU else 0.999) if params['saturation_protect'] else np.inf
+        sat_thresh = data_max * (0.9961 if on_gpu else 0.999) if params['saturation_protect'] else np.inf
         dthresh = params['dthresh']
 
         # σ² of the center pixel and the corresponding neighborhood slice in sigma_sq_map.
@@ -940,7 +953,11 @@ class MainWindow(QMainWindow):
         with np.errstate(divide='ignore', invalid='ignore'):
             d_norm = (d_raw - n_pair * sigma_comb) / (sigma_comb * np.sqrt(2.0 * n_pair))
         w = np.exp(-np.maximum(d_norm - dthresh, 0.0) / lam_sq)
-        w[(sigma_comb < 1e-10) | (n_pair < 1.0) | ~np.isfinite(w)] = 0.0          # degenerate pairs: no weight
+        # Degenerate pairs, mirroring both kernels: a vanishing normaliser gives
+        # dd = 1e6*n -> weight 0; a pair with NO comparable pixels (n = 0, e.g. a neighbour
+        # entirely at/above the saturation threshold) gives dd = 0 -> weight 1.
+        w[(sigma_comb < 1e-10) | ~np.isfinite(w)] = 0.0
+        w[n_pair < 1.0] = 1.0
         w[~keep] = 0.0                                                            # excluded neighbours
         w[cr * nc + cc] = 1.0                                                     # self-pair, as in both kernels
         weight_total = float(w.sum())
@@ -985,18 +1002,27 @@ class MainWindow(QMainWindow):
         n_avail = int(getattr(self, 'n_actual_rows', self.nrows))
         sig = None if nlobj.sigma is None else np.asarray(nlobj.sigma)
         if sig is None or sig.ndim != 2 or sig.shape != (n_avail, int(self.ncols)):
+            if self._nlpar_busy:
+                # A pyebsdindex call is in flight on this object (preview click during a
+                # batch). Do not start a second one; the caller falls back gracefully.
+                return
             N_p, ap_label = self._nlobj_mask_info(nlobj)
-            print(f"[σ² MAP] engine={NLPAR_ENGINE} aperture={ap_label} N_p={N_p} "
+            engine = self._nlpar_engine_of(nlobj)[1]
+            print(f"[σ² MAP] engine={engine} aperture={ap_label} N_p={N_p} "
                   f"rows={n_avail}/{self.nrows} source={'RAM' if from_ram else 'file'}")
-            self.statusBar().showMessage(f"Computing σ map with {NLPAR_ENGINE} (one-time per aperture)...")
+            self.statusBar().showMessage(f"Computing σ map with {engine} (one-time per aperture)...")
             QApplication.processEvents()
             self._unhook_nlpar_progress(nlobj)
             self._hook_nlpar_progress(nlobj, "σ map (pyebsdindex)", n_avail * int(self.ncols))
             # Both engines return (sigma, dist, count). calcsigma_cl also stores sigma on the
             # object, calcsigma_cpu does not (only opt_lambda_cpu does), so store it here so
             # the batch reuses it either way.
-            sig = np.asarray(nlobj.calcsigma(nn=1, automask=False, chunksize=self._nlpar_chunk_bytes(),
-                                             saturation_protect=self._nlpar_params()['saturation_protect'])[0])
+            self._nlpar_busy = True
+            try:
+                sig = np.asarray(nlobj.calcsigma(nn=1, automask=False, chunksize=self._nlpar_chunk_bytes(),
+                                                 saturation_protect=self._nlpar_params()['saturation_protect'])[0])
+            finally:
+                self._nlpar_busy = False
             nlobj.sigma = sig
         sigma_sq = np.zeros((int(self.nrows), int(self.ncols)), dtype=np.float32)
         sigma_sq[:sig.shape[0], :sig.shape[1]] = sig.astype(np.float32) ** 2
@@ -1056,12 +1082,24 @@ class MainWindow(QMainWindow):
         return dict(saturation_protect=bool(self.sat_chk.isChecked()),
                     dthresh=float(self.dthresh_spin.value()))
 
-    def _on_nlpar_param_changed(self):
-        self._invalidate_sigma_map()
+    def _on_nlpar_param_changed(self, which):
+        """which='saturation': sigma depends on it -> drop sigma, the shared object and the
+        lambda gate. which='dthresh': only the lambda fit depends on it -> re-arm the gate,
+        keep sigma (a full pass on a 31 GB scan; code review 2026-10-13)."""
+        if self._nlpar_busy:
+            return
+        if which == 'saturation':
+            self._invalidate_sigma_map()
+            self._nlobj = None; self._nlobj_key = None
         self._lambda_optimized = False
-        self._nlobj = None; self._nlobj_key = None
         if self.f_orig is not None:
             self.update_display()
+
+    def _nlpar_engine_of(self, nlobj):
+        """(on_gpu, label) for the object actually in use: the module-level choice can be
+        overridden per dataset by _get_nlobj (kernel not safe for this pattern size)."""
+        on_gpu = type(nlobj).__module__.startswith('pyebsdindex.opencl')
+        return on_gpu, ("pyebsdindex OpenCL" if on_gpu else "pyebsdindex CPU (numba)")
 
     def _nlpar_exclusion(self):
         """(nPatterns,) bool of patterns the IQ range excludes, or None if none.
@@ -1632,6 +1670,9 @@ class MainWindow(QMainWindow):
     def load_path(self, path):
         """Load a UP1/UP2 file by path (no dialog). Split out of load_file so the
         loader can be driven headlessly for testing."""
+        if self._nlpar_busy:
+            QMessageBox.information(self, "NLPAR is running", "Wait for the NLPAR step to finish before loading another file.")
+            return
         self.statusBar().showMessage("Loading patterns..."); QApplication.processEvents()
         # Drop EVERYTHING that belongs to the previous dataset before touching any widget.
         # The slider resets below emit valueChanged -> _update_iq_range -> update_display,
@@ -1855,6 +1896,8 @@ class MainWindow(QMainWindow):
           hand over IS makeautomask, so that case is unchanged.
         """
         if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1/UP2 file first"); return
+        if self._nlpar_busy:
+            QMessageBox.information(self, "NLPAR is running", "Wait for the running NLPAR step to finish."); return
         try:
             t0 = time.time()
             sr = self.sr_spin.value()
@@ -1864,15 +1907,23 @@ class MainWindow(QMainWindow):
             n_avail = int(getattr(self, 'n_actual_rows', self.nrows))
             N_p, ap_label = self._nlobj_mask_info(nlobj)
             budget = self._nlpar_chunk_bytes()
-            print(f"[OPT LAMBDA] engine={NLPAR_ENGINE} file={os.path.basename(self.orig_path)} SR={sr} "
+            engine = self._nlpar_engine_of(nlobj)[1]
+            print(f"[OPT LAMBDA] engine={engine} file={os.path.basename(self.orig_path)} SR={sr} "
                   f"aperture={ap_label} N_p={N_p}/{ph*pw} ({100.0*N_p/(ph*pw):.1f}%) "
                   f"rows={n_avail}/{self.nrows} chunk_budget={budget/1e9:.2f} GB "
                   f"source={'RAM' if from_ram else 'file'}")
             self.statusBar().showMessage(
                 f"Optimizing lambda (aperture={ap_label}, N_p={N_p})..."); QApplication.processEvents()
             self._hook_nlpar_progress(nlobj, "Optimize lambda (sigma pass)", n_avail * int(self.ncols))
-            nlobj.opt_lambda(chunksize=budget, automask=False, autoupdate=True, backsub=False,
-                             **self._nlpar_params())
+            params = self._nlpar_params()
+            # nlpar_cl.NLPAR.opt_lambda swallows a dthresh keyword instead of forwarding it
+            # (code review 2026-10-13); both engines read self.dthresh, so set it on the object.
+            nlobj.dthresh = float(params['dthresh'])
+            self._nlpar_busy = True
+            try:
+                nlobj.opt_lambda(chunksize=budget, automask=False, autoupdate=True, backsub=False, **params)
+            finally:
+                self._nlpar_busy = False
             self.lam_spin.setValue(float(nlobj.lam))
             self._lambda_optimized = True
             elapsed = time.time() - t0
@@ -1896,6 +1947,8 @@ class MainWindow(QMainWindow):
                 "'Apply NLPAR to Full Dataset' again.")
             return
         sr, lam = self.sr_spin.value(), self.lam_spin.value()
+        if self._nlpar_busy:
+            QMessageBox.information(self, "NLPAR is running", "Wait for the running NLPAR step to finish."); return
 
         if os.environ.get('KPP_NLPAR_ENGINE', '').strip().lower() == 'legacy':
             if not HAS_GPU:
@@ -2168,12 +2221,13 @@ class MainWindow(QMainWindow):
         reserves the file, then each tile is written in place). Without `fileout`
         pyebsdindex names the file itself as `<stem>_NLPAR_l{lam}sr{sr}.up1`, so the
         glob below is kept as a fallback."""
-        label = "GPU" if NLPAR_ON_GPU else "CPU"
+        label, engine = ("GPU" if NLPAR_ON_GPU else "CPU"), NLPAR_ENGINE
         try:
             self.statusBar().showMessage(f"Running NLPAR batch, {NLPAR_ENGINE} (SR={sr}, lam={lam:.2f})..."); QApplication.processEvents()
             t0 = time.time()
             ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
             nlobj, from_ram = self._get_nlobj(sr)
+            on_gpu, engine = self._nlpar_engine_of(nlobj); label = "GPU" if on_gpu else "CPU"
             # Order matters: unhook restores the I/O methods as they were before the last
             # hook, reset drops a previous batch's RAM output override, then this batch's
             # output is decided and the progress hook wraps the final methods.
@@ -2184,43 +2238,48 @@ class MainWindow(QMainWindow):
             N_p, ap_label = self._nlobj_mask_info(nlobj)
             out_path = os.path.join(os.path.dirname(self.orig_path), "_nlpar_result" + self.src_ext)
             budget = self._nlpar_chunk_bytes()      # CPU tiles; the OpenCL path sizes its own
-            sigma_reused = nlobj.sigma is not None and np.asarray(nlobj.sigma).size > 1
-            print(f"[NLPAR {label}] engine={NLPAR_ENGINE} SR={sr} lam={lam:.3f} aperture={ap_label} "
-                  f"N_p={N_p}/{ph*pw} ({100.0*N_p/(ph*pw):.1f}%) "
-                  f"rows={n_avail}/{self.nrows} chunk_budget={budget/1e9:.2f} GB "
-                  f"sigma={'reused from Optimize Lambda' if sigma_reused else 'computed now'} "
-                  f"source={'RAM' if from_ram else 'file'} -> {'RAM' if to_ram else out_path}")
-            finish = self._hook_nlpar_progress(nlobj, f"NLPAR batch ({label})", n_avail * int(self.ncols))
-            kw = dict(chunksize=budget, lam=float(lam), searchradius=int(sr),
-                      automask=False, backsub=False, **self._nlpar_params())
             # IQ-range exclusion (Phase 3): excluded patterns are served to pyebsdindex as
-            # zero patterns with sigma 0, which gives them zero weight as neighbours (see
+            # constant patterns with sigma 0, which gives them zero weight as neighbours (see
             # RamUPFile._apply_exclude); their own output is zeroed below. The true sigma
             # map is put back afterwards so preview / lambda keep using it.
             excl = self._nlpar_exclusion()
             if excl is not None and (nlobj.sigma is None or np.asarray(nlobj.sigma).ndim != 2):
-                # Sigma must come from the real patterns, not from the zero-served ones
-                # (a zero pattern next to real ones would get a huge sigma and, through
-                # the normalisation, full weight). Normally Optimize Lambda already did this.
+                # Sigma must come from the real patterns, not from the constant-served ones
+                # (a flat pattern next to real ones would get a huge sigma and, through the
+                # normalisation, full weight). Normally Optimize Lambda already did this.
+                # Before the progress hook below, so its own hook/state are not disturbed.
                 self._ensure_sigma_map()
+            sigma_reused = nlobj.sigma is not None and np.asarray(nlobj.sigma).size > 1
+            print(f"[NLPAR {label}] engine={engine} SR={sr} lam={lam:.3f} aperture={ap_label} "
+                  f"N_p={N_p}/{ph*pw} ({100.0*N_p/(ph*pw):.1f}%) "
+                  f"rows={n_avail}/{self.nrows} chunk_budget={budget/1e9:.2f} GB "
+                  f"sigma={'reused from Optimize Lambda' if sigma_reused else 'computed now'} "
+                  f"source={'RAM' if from_ram else 'file'} -> {'RAM' if to_ram else out_path}")
+            kw = dict(chunksize=budget, lam=float(lam), searchradius=int(sr),
+                      automask=False, backsub=False, **self._nlpar_params())
             true_sigma = nlobj.sigma
             if excl is not None:
                 print(f"[NLPAR {label}] IQ range excludes {int(excl.sum())} of {excl.size} patterns "
-                      f"(served as zero patterns, sigma 0, output zeroed)")
+                      f"(served as constant patterns, sigma 0, output zeroed)")
                 self._nl_infile.exclude = excl
                 if true_sigma is not None and np.asarray(true_sigma).ndim == 2:
                     s = np.array(true_sigma, dtype=np.float32, copy=True)
                     keep = ~excl[:s.size].reshape(-1)
                     s.reshape(-1)[:keep.size] *= keep.astype(np.float32)
                     nlobj.sigma = s
+            finish = self._hook_nlpar_progress(nlobj, f"NLPAR batch ({label})", n_avail * int(self.ncols))
+            self._nlpar_busy = True
             try:
                 if to_ram:
                     nlobj.calcnlpar(**kw)
                 else:
                     result_path = nlobj.calcnlpar(fileout=out_path, **kw)
             finally:
+                self._nlpar_busy = False
                 self._nl_infile.exclude = None
-                nlobj.sigma = true_sigma
+                if excl is not None:
+                    nlobj.sigma = true_sigma      # only then was the array replaced; otherwise keep
+                                                  # whatever calcnlpar computed for later reuse
             finish()
             if excl is not None and (to_ram or (result_path and os.path.isfile(result_path))):
                 self._zero_excluded_output(excl, self.nlpar_patterns if to_ram else result_path, ph, pw)
@@ -2229,7 +2288,7 @@ class MainWindow(QMainWindow):
                 self.f_nlpar = RamUPFile(self.orig_path, self.nlpar_patterns)
                 self.nlpar_chk.setChecked(False)
                 self.nlpar_status.setText(f"NLPAR in RAM ({label}): SR={sr}, lam={lam:.2f} ({elapsed:.1f}s)")
-                self.statusBar().showMessage(f"NLPAR batch complete in RAM ({elapsed:.1f}s, {NLPAR_ENGINE}, N_p={N_p})")
+                self.statusBar().showMessage(f"NLPAR batch complete in RAM ({elapsed:.1f}s, {engine}, N_p={N_p})")
                 print(f"[NLPAR {label}] done in {elapsed:.1f}s -> RAM")
                 self.update_display()
                 return
@@ -2244,7 +2303,7 @@ class MainWindow(QMainWindow):
                 self.f_nlpar = ebsd_pattern.get_pattern_file_obj(result_path)
                 self.nlpar_chk.setChecked(False)
                 self.nlpar_status.setText(f"NLPAR ({label}): SR={sr}, lam={lam:.2f} ({elapsed:.1f}s)")
-                self.statusBar().showMessage(f"NLPAR batch complete ({elapsed:.1f}s, {NLPAR_ENGINE}, N_p={N_p})")
+                self.statusBar().showMessage(f"NLPAR batch complete ({elapsed:.1f}s, {engine}, N_p={N_p})")
                 print(f"[NLPAR {label}] done in {elapsed:.1f}s -> {result_path}")
             else:
                 QMessageBox.warning(self, "Warning", "NLPAR ran but output not found.")
@@ -2536,12 +2595,12 @@ class MainWindow(QMainWindow):
         self.sat_chk = QCheckBox("Saturation protect (pyebsdindex)"); self.sat_chk.setChecked(True)
         self.sat_chk.setToolTip("Drop pixel pairs where either value is at/above ~max intensity from the "
                                 "NLPAR distance and the sigma estimate (pyebsdindex saturation_protect).")
-        self.sat_chk.toggled.connect(lambda *_: self._on_nlpar_param_changed())
+        self.sat_chk.toggled.connect(lambda *_: self._on_nlpar_param_changed('saturation'))
         self.dthresh_spin = QDoubleSpinBox(); self.dthresh_spin.setRange(0.0, 100.0)
         self.dthresh_spin.setValue(0.0); self.dthresh_spin.setSingleStep(0.1); self.dthresh_spin.setDecimals(2)
         self.dthresh_spin.setToolTip("pyebsdindex dthresh: subtracted from the normalised dissimilarity before "
                                      "the exponent, so pairs below it count as identical. 0 = off.")
-        self.dthresh_spin.valueChanged.connect(lambda *_: self._on_nlpar_param_changed())
+        self.dthresh_spin.valueChanged.connect(lambda *_: self._on_nlpar_param_changed('dthresh'))
         gl.addRow(self.sat_chk); gl.addRow("Distance threshold:", self.dthresh_spin)
         b1 = QPushButton("Optimize Lambda"); b1.clicked.connect(self.optimize_lambda)
         b2 = QPushButton(f"Apply NLPAR to Full Dataset ({'GPU' if NLPAR_ON_GPU else 'CPU'}, pyebsdindex)"); b2.clicked.connect(self.apply_nlpar_batch)

@@ -6,6 +6,36 @@ was done, what was verified, and what is deliberately NOT done yet.
 `OSC_SETUP.md` (from the original repo) is still the general Linux/OSC guide;
 this file is the delta on top of it.
 
+## v1.6.0.dev5 (2026-10-13): code-review fixes before the first push
+
+A review of the day's commits (origin/main..HEAD) found ten issues; all fixed:
+- IQ exclusion on the OpenCL engine made every tile with an excluded pattern compute
+  four times: the all-zero served pattern gave an all-zero output, which pyebsdindex's
+  calcnlpar_cl takes for its Apple-silicon GPU failure and re-queues up to 3 times.
+  Excluded patterns are now served as constant 1 (same exp(-huge) = 0 weight), outputs
+  still zeroed afterwards. 8-row FG10 subset with 3 patterns excluded (3 tiles affected): batch time
+  17.0 s vs 17.0 s without exclusion (would have been ~2x with the retries).
+- Optimize Lambda ignored the Distance threshold on the OpenCL engine (nlpar_cl.opt_lambda
+  swallows the keyword); the value is now set on the object first, both engines.
+- A dthresh change no longer throws away sigma and the shared object (only saturation
+  protect does); it only re-arms the lambda gate.
+- Engine label / preview saturation factor follow the object actually in use
+  (`_nlpar_engine_of`), not the module-level choice, for the forced-numba fallback.
+- Busy guard (`_nlpar_busy`): while a pyebsdindex call runs, Optimize Lambda, the batch,
+  file load, aperture and parameter changes are refused with a message instead of
+  re-entering through the progress hook's processEvents; a preview click during a batch
+  shows the raw pattern if sigma is not there yet.
+- Sigma computed by calcnlpar itself is kept on the object (was discarded when no
+  exclusion was active); sigma for an exclusion batch is ensured before the progress
+  hook is installed.
+- Preview mirrors both kernels for a neighbour with no comparable pixels (n = 0): weight 1.
+- MaskedUPFile no longer copies a slab tile twice (slab reads are masked per row already).
+- Derived kernel copies go to a per-user temp directory.
+- Runtime transform of an unknown pyebsdindex clnlpar.cl (`_transform_clnlpar`) derives
+  the full fix when every anchor matches; verified byte-identical output to the shipped
+  copy. Upstream main is byte-identical to 0.3.9.1 today.
+All smoke tests re-run on both engines (synthetic, streamed, uint16, exclusion, 8-row real).
+
 ## v1.6.0.dev4 (2026-10-13): first real data (Phase 4, laptop part). Two more pyebsdindex OpenCL bugs, fixed in a shipped kernel copy
 
 Test set (Max's choice): first 24 rows of `FG10 3 Disc RKD.up1` (207 cols x 138 rows,
