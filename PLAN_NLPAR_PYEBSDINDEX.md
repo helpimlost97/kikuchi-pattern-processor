@@ -65,12 +65,32 @@ small EBSD patterns pyebsdindex should be several times faster; on OSC's H100 th
 - Cap the SR spin box at 10.
 - Keep the CuPy batch reachable only via `KPP_NLPAR_ENGINE=legacy` until Phase 4.
 
-### Phase 2: preview and sigma parity
-- Sigma map from `nlobj.calcsigma()` (returns sigma, dist, countnn); store sigma^2 per
-  aperture; delete `_compute_sigma_map_gpu/_cpu`.
-- Rewrite `_compute_nlpar_single` to reproduce the kernel arithmetic exactly (mirrored
-  borders, saturation_protect, per-pair n, dthresh, same normalisation).
-- Acceptance: preview at a pixel == batch output at that pixel within integer rounding.
+### Guiding rule (Max, 2026-10-13)
+Use pyebsdindex modules wherever they exist; homebrew code only for (a) features
+pyebsdindex does not have, which Phase 3 adds on top of it, and (b) speedups that are
+clearly worth it, to be discussed later. Homebrew inventory in the viewer and its fate:
+
+| Homebrew piece | pyebsdindex replacement | Phase |
+|---|---|---|
+| single-pixel NLPAR / NPAR preview (`_compute_nlpar_single`, NPAR average) | `calcnlpar` on a (2SR+1)^2 sub-scan around the pixel, served from RAM, full-scan sigma preset on the object; NPAR = same call with a very large lambda | 2 |
+| sigma map (`_compute_sigma_map_gpu/_cpu`) | `calcsigma` on the shared NLPAR object | 2 |
+| circular aperture (copy of `makeautomask`) | call `nlpar.NLPAR.makeautomask` | 2 |
+| CuPy NLPAR batch (`_apply_nlpar_gpu`) | `calcnlpar` (done in Phase 1) | delete after Phase 4 run |
+| static/dynamic background, normalize, CLAHE, B/C, IQ map, global stretch | not in pyebsdindex (only a Gaussian-surface `backsub`); kikuchipy has all of them | later discussion |
+| parallel UP reader, RAM serving (`read_patterns_parallel`, `RamUPFile`) | pyebsdindex reads row by row (slow); speed item | later discussion |
+
+### Phase 2: sigma, preview and aperture through pyebsdindex
+- Sigma map from `nlobj.calcsigma()` (returns sigma, dist, countnn) on the shared object;
+  store sigma^2 per aperture for display/diagnostics; delete `_compute_sigma_map_gpu/_cpu`.
+- Preview: build a (2SR+1) x (2SR+1) sub-scan around the clicked pixel (RamUPFile view
+  when in RAM, otherwise read the rows), preset `nlobj.sigma` to the matching slice of the
+  full-scan sigma, run `calcnlpar` with the current engine, take the centre pattern.
+  Interior pixels then equal the batch exactly; at scan edges the sub-scan border rule
+  (CPU shifts inward, GPU mirrors) is applied to a smaller block, so a small difference
+  is accepted and documented. NPAR preview = same call, lambda = 1e6.
+- Circular aperture via `nlpar.NLPAR.makeautomask`; delete the local copy.
+- Acceptance: interior preview == batch output at that pixel within integer rounding, on
+  both engines.
 
 ### Phase 3: features pyebsdindex lacks
 - IQ-range exclusion: short term, zero excluded patterns in the output after the batch
