@@ -49,8 +49,10 @@ turned out to be useful enough to publish.
   - σ map and **Optimize λ** come from `pyebsdindex.nlpar.NLPAR.calcsigma` /
     `opt_lambda` on one shared object, so σ is computed once per aperture
   - **IQ-range exclusion** carries into the batch: patterns outside the IQ range
-    are neither averaged nor used as neighbours (served to pyebsdindex as zero
-    patterns with σ = 0, which gives them zero weight) and come out as zeros
+    are neither averaged nor used as neighbours (served to pyebsdindex as flat
+    patterns with σ = 0, which gives them zero weight) and come out as zeros.
+    Originally built for identifying carbides by TKD on extraction replicas,
+    where most of the map is empty film and only the particles carry patterns
   - pyebsdindex's `saturation_protect` and `dthresh` are exposed in the panel
     with their defaults (on, 0) and apply to σ, λ, batch and preview alike
   - Scan borders follow pyebsdindex: the CPU kernel shifts the window inward at
