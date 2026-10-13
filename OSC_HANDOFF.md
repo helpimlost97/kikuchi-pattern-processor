@@ -6,6 +6,67 @@ was done, what was verified, and what is deliberately NOT done yet.
 `OSC_SETUP.md` (from the original repo) is still the general Linux/OSC guide;
 this file is the delta on top of it.
 
+## v1.6.0.dev4 (2026-10-13): first real data (Phase 4, laptop part). Two more pyebsdindex OpenCL bugs, fixed in a shipped kernel copy
+
+Test set (Max's choice): first 24 rows of `FG10 3 Disc RKD.up1` (207 cols x 138 rows,
+479x479 uint8, 6.55 GB; subset 1.14 GB), aperture Auto-detect (N_p 218736/229441), SR 6,
+lambda fixed at 1.39 (Max's historical value; Optimize Lambda gives 1.54-1.55 here).
+
+**pyebsdindex's OpenCL kernels crash on 479x479 patterns** (`clFinish failed:
+INVALID_COMMAND_QUEUE`, within ~1 s, even on an 8x6 scan; TdrDelay is 10 s so not a
+watchdog). Cause: both kernels read patterns through `*(__global float16*)` casts and
+`calcnlpar` accumulates output through the same cast. For a pixel count that is not a
+multiple of 16 this is (a) misaligned (faults when npix % 4 != 0: 49x49, 50x51, 479x479,
+479x481) and (b) the last vector overruns into the next pattern / past the buffer (52x51
+faults too; 50x50 survives by allocation luck) with a read-modify-write race on the
+neighbour's first pixels. Standard EBSD sizes (60x60, 120x120, 480x480) are multiples of
+16, so upstream never saw it. Fix: `patches/clnlpar_fixed.cl`, a complete copy of the
+0.3.9.x kernel with vload16/vstore16, element-wise handling of the partial tail vector, a
+register accumulator with one store per vector, and the sigma-index fix. The viewer uses
+it when the installed `clnlpar.cl` has a known sha1 (`_KNOWN_SHIPPED_CLNLPAR`); for an
+unknown upstream version it falls back to the one-line sigma fix and routes datasets with
+npix % 16 != 0 to the numba engine (`_gpu_kernel_safe_for`). Verified: builds, runs on
+every size that failed, and the interior output equals numba's within 1 grey level on
+49x49, 50x50, 61x61, 95x97 and the real 479x479 subset (mean 0.03, max 1). Added to
+`UPSTREAM_pyebsdindex_opencl_sigma_bug.md`.
+
+**Results on the 24-row subset (laptop, RTX 5070 8 GB, 24 threads):**
+
+| step | pyebsdindex OpenCL | pyebsdindex numba | legacy CuPy |
+|---|---|---|---|
+| Optimize Lambda (incl. sigma) | 2.9 s | 3.9 s | n/a |
+| NLPAR batch, SR 6 | 67.5 s | 42.6 s | 110.8 s |
+| full 138-row scan, extrapolated | ~6.5 min | ~4 min | ~10.5 min |
+| preview, 479x479, SR 6 | 0.24-0.40 s/click | 0.6 s | n/a |
+
+As estimated from source: with 479x479 patterns the OpenCL tiles are ~270 work-items and
+numba on 24 cores beats it. `KPP_GPU=0` picks numba.
+
+**Agreement:** pyebsdindex OpenCL vs numba, interior: mean 0.03, max 1 grey level (border
+mean 1.8: different border rules). Legacy CuPy vs pyebsdindex with saturation protect
+OFF: mean 0.02, max 1 (same mathematics, confirmed on real data). Preview vs batch at
+6 interior pixels: within 1.01 (OpenCL) / 2.3 (numba; tile-max vs data-max saturation
+threshold, see below).
+
+**Why the legacy batch is no longer comparable with saturation protect ON.** The NLPAR
+weight is a z-score, (d - 2N sigma^2) / (2 sigma^2 sqrt(2N)); with N ~ 2.2e5 the sqrt(2N)
+= 661 makes it hypersensitive to sigma: a 5 % bias in sigma^2 shifts the z-score by ~16.
+Since Phase 2 the legacy kernel takes pyebsdindex's sigma (saturated pixel pairs
+excluded) but computes d with them included; this RKD scan has 0.6 % saturated pixels
+and 36 % of pixel positions saturated in at least one neighbour, so every neighbour
+weight collapsed and the legacy output equalled the input (|out - in| 0.5). Sigma and
+d must be estimated on the same pixel set; pyebsdindex does that in both engines.
+Legacy now prints a warning when saturation protect is on; it will be deleted.
+
+**Saturation protect matters on this data**: OFF vs ON differ by mean 1.2, p99 7, max 74
+grey levels in the interior. ON is pyebsdindex's default and what the panel defaults to.
+
+**Preview** vectorised over the neighbourhood (was a per-neighbour Python loop with
+masked copies, 0.9 s/click on 479x479): now 0.24 s (saturation off) / 0.40 s (on), of
+which 0.1 s is reading the 169 patterns.
+
+Not done: the full 138-row run in the GUI (Max does that next), OSC side.
+
 ## v1.6.0.dev3 (2026-10-13): features pyebsdindex lacks, built around it (Phase 3)
 
 - **IQ-range exclusion in the batch, without touching pyebsdindex.** pyebsdindex has no

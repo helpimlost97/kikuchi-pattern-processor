@@ -111,10 +111,12 @@ clearly worth it, to be discussed later. Homebrew inventory in the viewer and it
 - Upstream bug report drafted: UPSTREAM_pyebsdindex_opencl_sigma_bug.md (not posted).
 
 ### Phase 4: validation and docs
-- **OPEN DECISION: which pattern set to validate on is undecided.** Candidates on the
-  laptop: `FGHAZ 25/map20250109115929899.up1` (0.67 GB), `FGHAZ 25/ICHAZ25_20000_50nm.up1`
-  (6.5 GB), `Base Metal/Area 1/map20260308181623025.up1` (7.8 GB); on OSC the 32 GB Ni RKD
-  scan. Ask Max before running anything (no unrequested benchmarks on the laptop).
+- **Dataset decided (Max, 2026-10-13): `FG10 3 Disc RKD.up1`** (OneDrive, MAM/CEMAS/FG10 3
+  Disc RKD; 207x138, 479x479 uint8, 6.55 GB). Headless checks on the first 24 rows done
+  (see OSC_HANDOFF.md v1.6.0.dev4); Max runs the full scan in the GUI on the laptop next and
+  reports bugs, then asks for a comparison. Subset + results sit in the session scratch dir
+  (`scratchpad/p4/`): `fg10_24rows.up1`, `nlpar_gpu.npy` (OpenCL, sat on), `nlpar_cpu.npy`
+  (numba, sat on), `nlpar_gpu_nosat.npy`, `nlpar_legacy.npy`, `timings_*.json`.
 - Compare pyebsdindex GPU vs pyebsdindex CPU (expect near-identical), then vs the legacy
   CuPy path (expect differences only at borders / saturated pixels). Time both.
 - Rewrite `osc_gpu_selftest.py` to compare pyebsdindex GPU vs CPU; run once on Cardinal GPU.
@@ -145,6 +147,27 @@ upstream fixes it; `KPP_NLPAR_KERNEL_PATCH=0` disables). **To do: report / PR up
 fix and only in the interior: borders differ by design (CPU shifts the window inward,
 GPU mirrors) and the saturation threshold differs (0.999 vs 0.9961 of max).
 
+## Finding during Phase 4: pyebsdindex OpenCL kernels fault on pattern sizes that are not a multiple of 16 (2026-10-13)
+
+`*(__global float16*)` casts in `calcsigma` / `calcnlpar` (misaligned when npix % 4 != 0,
+and an unguarded partial last vector that overruns into the next pattern with a += race).
+479x479 (229441 px) crashes with INVALID_COMMAND_QUEUE within a second. Fixed in
+`patches/clnlpar_fixed.cl` (vload16/vstore16, element-wise tail, register accumulation),
+used by the viewer when the installed kernel's sha1 is known; otherwise numba is used for
+such datasets. Interior output equals numba within 1 grey level on all tested sizes.
+Also in the upstream report draft.
+
+## Finding during Phase 4: sigma and distance must use the same pixel set (2026-10-13)
+
+The NLPAR weight is a z-score with sqrt(2N) ~ 661 in the denominator for 479x479 patterns,
+so a few % bias between the sigma estimate and the distance (e.g. saturated pixel pairs
+dropped from one but not the other) shifts it by >10 and zeroes every neighbour. This is
+why the legacy CuPy batch, fed pyebsdindex's saturation-protected sigma since Phase 2,
+returned the input unchanged on FG10 RKD. pyebsdindex is self-consistent in both engines;
+the legacy path is comparable only with saturation protect OFF (then: mean diff 0.02,
+max 1). Any future homebrew that reuses pyebsdindex's sigma must apply the same
+saturation rule to its distances (the preview does).
+
 ## Status
 - 2026-10-13: decision taken; Phase 0 done on the laptop (pyopencl 2026.1.4 installed,
   KPP_GPU=0 import guard, requirements note). OSC side of Phase 0 not started.
@@ -162,3 +185,8 @@ GPU mirrors) and the saturation threshold differs (0.999 vs 0.9961 of max).
   patterns + sigma 0, saturation_protect / dthresh controls, upstream report drafted.
   Synthetic-scan checks pass on both engines. Legacy CuPy batch kept until the Phase 4 run
   (Max). Still not run on real data; OSC untouched.
+- 2026-10-13: Phase 4, laptop part (v1.6.0.dev4): FG10 RKD 24-row subset run on all three
+  engines; OpenCL kernel alignment/tail bugs found and fixed via patches/clnlpar_fixed.cl;
+  OpenCL == numba (interior max 1); legacy == pyebsdindex with saturation protect off;
+  timings in OSC_HANDOFF.md. Remaining: Max's full-scan GUI run + comparison, OSC
+  (pyopencl in venv, ICD check, selftest rewrite), delete legacy, tag 1.6.0.

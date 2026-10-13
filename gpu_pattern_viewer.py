@@ -1,4 +1,4 @@
-__version__ = "1.6.0.dev3"   # shown in the window title; bump with each release (git tag v<version>)
+__version__ = "1.6.0.dev4"   # shown in the window title; bump with each release (git tag v<version>)
 import sys
 import os
 import glob
@@ -62,34 +62,55 @@ def _patch_pyebsdindex_nlpar_kernel():
     from the installed file at every start; once upstream fixes the line the replace is
     a no-op and nothing is redirected. Reported upstream: see PLAN_NLPAR_PYEBSDINDEX.md."""
     if not NLPAR_ON_GPU:
-        return None
+        return None, None
     try:
         import hashlib, tempfile
         from pyebsdindex.opencl import openclparam
         src = os.path.join(os.path.dirname(openclparam.__file__), 'clnlpar.cl')
         text = open(src, encoding='utf-8').read()
-        bad, good = "sigma_ij = sigma[indx_xy];", "sigma_ij = sigma[indx_ij];"
-        if text.count(bad) != 1:
-            return None                      # fixed upstream (or changed beyond recognition): leave it
-        fixed = text.replace(bad, good)
-        tag = hashlib.sha1(fixed.encode()).hexdigest()[:12]
-        kdir = os.path.join(tempfile.gettempdir(), 'kikuchi_pattern_processor')
-        os.makedirs(kdir, exist_ok=True)
-        dst = os.path.join(kdir, f'clnlpar_fixed_{tag}.cl')
-        if not os.path.exists(dst):
-            with open(dst, 'w', encoding='utf-8') as f: f.write(fixed)
+        sha = hashlib.sha1(text.encode('utf-8')).hexdigest()
+        full = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'patches', 'clnlpar_fixed.cl')
+        if sha in _KNOWN_SHIPPED_CLNLPAR and os.path.isfile(full):
+            dst, level = full, 'full'            # known 0.3.9.x file: use our complete fixed copy
+        else:
+            bad, good = "sigma_ij = sigma[indx_xy];", "sigma_ij = sigma[indx_ij];"
+            if text.count(bad) != 1:
+                return None, None                # fixed upstream (or changed beyond recognition): leave it
+            fixed = text.replace(bad, good)
+            tag = hashlib.sha1(fixed.encode()).hexdigest()[:12]
+            kdir = os.path.join(tempfile.gettempdir(), 'kikuchi_pattern_processor')
+            os.makedirs(kdir, exist_ok=True)
+            dst = os.path.join(kdir, f'clnlpar_fixed_{tag}.cl')
+            if not os.path.exists(dst):
+                with open(dst, 'w', encoding='utf-8') as f: f.write(fixed)
+            level = 'sigma-only'
+            print(f"[NLPAR] unknown pyebsdindex clnlpar.cl (sha1 {sha[:12]}): only the sigma-index fix is applied; "
+                  f"pattern sizes with (height*width) % 16 != 0 will run NLPAR on the CPU instead")
         orig = openclparam.OpenClParam.get_context
         def get_context(self, gpu_id=None, kfile='clkernels.cl'):
             if kfile == 'clnlpar.cl':
                 kfile = dst
             return orig(self, gpu_id=gpu_id, kfile=kfile)
         openclparam.OpenClParam.get_context = get_context
-        return dst
+        return dst, level
     except Exception as _e:
         print(f"[NLPAR] could not patch pyebsdindex's OpenCL kernel ({_e}); using it as shipped")
-        return None
+        return None, None
 
-NLPAR_KERNEL_PATCH = None if os.environ.get('KPP_NLPAR_KERNEL_PATCH', '').strip() == '0' else _patch_pyebsdindex_nlpar_kernel()
+# sha1 of pyebsdindex/opencl/clnlpar.cl as shipped in releases our full patch was made from.
+_KNOWN_SHIPPED_CLNLPAR = {
+    '14c0d609073680260f57d0d48aa71fcb29e18f3f',   # 0.3.9.1 (pip, 2026-10)
+}
+if os.environ.get('KPP_NLPAR_KERNEL_PATCH', '').strip() == '0':
+    NLPAR_KERNEL_PATCH, NLPAR_KERNEL_PATCH_LEVEL = None, None
+else:
+    NLPAR_KERNEL_PATCH, NLPAR_KERNEL_PATCH_LEVEL = _patch_pyebsdindex_nlpar_kernel()
+
+def _gpu_kernel_safe_for(ph, pw):
+    """The shipped OpenCL kernels fault (INVALID_COMMAND_QUEUE) or corrupt data when the
+    pixel count is not a multiple of 16 (float16 pointer casts + an unguarded tail vector);
+    our full patch fixes that. Without it, such datasets must use the CPU engine."""
+    return (not NLPAR_ON_GPU) or NLPAR_KERNEL_PATCH_LEVEL == 'full' or ((int(ph) * int(pw)) % 16 == 0)
 from scipy.ndimage import gaussian_filter
 from skimage.exposure import equalize_adapthist
 import time
@@ -134,7 +155,7 @@ if HAS_GPU:
 if not HAS_GPU:
     print(f"[GPU] CPU mode ({_gpu_why})")
 print(f"[NLPAR] engine: {NLPAR_ENGINE}"
-      + (f"; OpenCL kernel sigma-index fix applied ({os.path.basename(NLPAR_KERNEL_PATCH)})" if NLPAR_KERNEL_PATCH
+      + (f"; OpenCL kernel patch: {NLPAR_KERNEL_PATCH_LEVEL} ({os.path.basename(NLPAR_KERNEL_PATCH)})" if NLPAR_KERNEL_PATCH
          else ("; kernel used as shipped" if NLPAR_ON_GPU else "")))
 
 # psutil lets chunk sizes track ACTUAL free host RAM instead of a hardcoded row count.
@@ -839,38 +860,42 @@ class MainWindow(QMainWindow):
         sigma_sq_nb = self.sigma_sq_map[r0:r1, c0:c1].astype(np.float64)
         sigma_sq_i = float(self.sigma_sq_map[row, col])
 
-        weighted_sum = np.zeros((ph, pw), dtype=np.float64)
-        weight_total = 0.0
         lam_sq = lam * lam
-        center_flat = center_pat.ravel()
-        center_ok = ap_flat & (center_flat < sat_thresh)
-
-        for ri in range(nr):
-            for ci in range(nc):
-                if not mask[ri, ci]:
-                    continue
-                nb_pat = pats[ri, ci].astype(np.float64)
-                nb_flat = nb_pat.ravel()
-                valid = center_ok & (nb_flat < sat_thresh)        # per-pair pixel set
-                n = float(valid.sum())
-                diff = (nb_flat - center_flat)[valid]
-                d_raw = float(np.dot(diff, diff))
-                sigma_sq_j = float(sigma_sq_nb[ri, ci])
-                sigma_combined = sigma_sq_i + sigma_sq_j
-                if ri == cr and ci == cc:
-                    w = 1.0                                        # self-pair, as in both kernels
-                elif sigma_combined < 1e-10 or n < 1.0:
-                    # Degenerate σ² (or no comparable pixels) → this neighbour gets no weight.
-                    w = 0.0
-                else:
-                    d_norm = (d_raw - n * sigma_combined) / (sigma_combined * np.sqrt(2.0 * n))
-                    d_clipped = max(d_norm - dthresh, 0.0)
-                    w = np.exp(-d_clipped / lam_sq)
-                weighted_sum += w * nb_pat
-                weight_total += w
-
+        # Vectorised over the neighbourhood (a 479x479 pattern with SR 6 is 169 x 229k
+        # values; a per-neighbour Python loop with masked copies took ~0.9 s per click,
+        # this takes a fraction of that). float32 is exact for uint8/uint16 differences;
+        # the sums run in float64.
+        npix = ph * pw
+        P = pats.reshape(nr * nc, npix).astype(np.float32, copy=False)            # (N, npix)
+        c32 = center_pat.astype(np.float32).ravel()
+        center_ok = ap_flat & (c32 < sat_thresh)
+        keep = np.asarray(mask, dtype=bool).ravel()                               # IQ-range mask
+        d_raw = np.zeros(nr * nc, dtype=np.float64); n_pair = np.zeros(nr * nc, dtype=np.float64)
+        step = max(1, int(1.5e8 // max(npix * 4, 1)))                             # ~150 MB per block
+        c_ok32 = center_ok.astype(np.float32)
+        for a in range(0, nr * nc, step):
+            blk = P[a:a + step]                                                   # view, no gather copy
+            diff = blk - c32                                                      # (k, npix) float32
+            diff *= diff
+            if np.isfinite(sat_thresh):
+                valid = (blk < sat_thresh).astype(np.float32); valid *= c_ok32    # per-pair pixel set
+                diff *= valid
+                n_pair[a:a + step] = valid.sum(axis=1, dtype=np.float64)
+            else:
+                diff *= c_ok32
+                n_pair[a:a + step] = float(center_ok.sum())
+            d_raw[a:a + step] = diff.sum(axis=1, dtype=np.float64)
+        sigma_comb = sigma_sq_i + sigma_sq_nb.ravel()
+        with np.errstate(divide='ignore', invalid='ignore'):
+            d_norm = (d_raw - n_pair * sigma_comb) / (sigma_comb * np.sqrt(2.0 * n_pair))
+        w = np.exp(-np.maximum(d_norm - dthresh, 0.0) / lam_sq)
+        w[(sigma_comb < 1e-10) | (n_pair < 1.0) | ~np.isfinite(w)] = 0.0          # degenerate pairs: no weight
+        w[~keep] = 0.0                                                            # excluded neighbours
+        w[cr * nc + cc] = 1.0                                                     # self-pair, as in both kernels
+        weight_total = float(w.sum())
         if weight_total > 0:
-            return weighted_sum / weight_total
+            # float32 matvec over <= (2SR+1)^2 terms: error ~1e-6 relative, far below 1 grey level
+            return (w.astype(np.float32) @ P).astype(np.float64).reshape(ph, pw) / weight_total
         return center_pat
 
     # ------------------------------------------------------------------
@@ -952,7 +977,14 @@ class MainWindow(QMainWindow):
         n_avail = int(getattr(self, 'n_actual_rows', self.nrows))
         key = (self.orig_path, self._aperture_key(), n_avail)
         if self._nlobj is None or self._nlobj_key != key:
-            nlobj = nlpar.NLPAR(self.orig_path, searchradius=int(sr))
+            ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
+            cls = nlpar.NLPAR
+            if not _gpu_kernel_safe_for(ph, pw):
+                from pyebsdindex import nlpar_cpu
+                cls = nlpar_cpu.NLPAR
+                print(f"[NLPAR] {ph}x{pw} patterns ({ph*pw} px, not a multiple of 16) and the OpenCL kernel is "
+                      f"not fully patched: using pyebsdindex's CPU engine for this dataset")
+            nlobj = cls(self.orig_path, searchradius=int(sr))
             # Truncated file: cap the scan rows pyebsdindex will read. getinfileobj()
             # forces fID.nRows = self.nrows whenever self.nrows is not None.
             if n_avail < self.nrows:
@@ -1834,6 +1866,15 @@ class MainWindow(QMainWindow):
         formulation. See _compute_nlpar_single docstring for the equations."""
         # Ensure σ² map is available for the current aperture.
         self._ensure_sigma_map()
+        if self._nlpar_params()['saturation_protect']:
+            # The weight is a z-score with sqrt(2N) in the denominator (N ~ 2e5 pixels), so
+            # sigma must be estimated on exactly the pixel set the distance uses. Since
+            # Phase 2 the sigma map is pyebsdindex's, which drops saturated pixel pairs;
+            # this kernel does not, and on a scan with saturated pixels every neighbour
+            # weight collapses to ~0 (FG10 RKD: output == input). Measured 2026-10-13.
+            print("[GPU NLPAR] WARNING: legacy CuPy batch with 'Saturation protect' ON is not self-consistent "
+                  "(sigma excludes saturated pixel pairs, this kernel does not); results are only comparable "
+                  "to pyebsdindex with saturation protect OFF.")
         self.statusBar().showMessage(f"Running NLPAR GPU (SR={sr}, lam={lam:.2f})..."); QApplication.processEvents()
         t0 = time.time()
         ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)

@@ -72,6 +72,34 @@ kernel mirrors indices).
 pyebsdindex 0.3.9.1 (pip), pyopencl 2026.1.4, NVIDIA RTX 5070 Laptop (driver 616.64),
 Windows 11, Python 3.14. The line is unchanged in `main` as of 2026-10-13.
 
+**Second bug, same file: pattern sizes that are not a multiple of 16 pixels crash or corrupt**
+
+Both `calcsigma` and `calcnlpar` read pattern vectors with raw casts,
+`*(__global float16*) (data + indx_ij + 16*z)`, and `calcnlpar` accumulates its output
+with `*(__global float16*) (dataout + indx0 + 16*z) += d1`. That assumes (a) every pattern
+starts at a 64-byte aligned address and (b) `npatpoint` is a multiple of 16. Neither
+holds for e.g. 479 x 479 patterns (229,441 px, a direct-electron RKD detector):
+
+- Alignment: pattern k starts at `k * npatpoint * 4` bytes. On NVIDIA the vector load is
+  compiled to 16-byte loads, so any `npatpoint` with `npatpoint % 4 != 0` faults with
+  `clFinish failed: INVALID_COMMAND_QUEUE` on the first tile. Reproduced with 49x49,
+  50x51, 479x479, 479x481 (8 x 6 scan, trivial work, fails in ~1 s; TdrDelay = 10 s so
+  not a watchdog timeout).
+- Tail vector: the last of the `ceil(npatpoint/16)` vectors runs up to 15 floats past the
+  pattern, i.e. into the next pattern and, for the last pattern of a tile, past the end
+  of `datapad_gpu` (reproduced: 52x51 = 2652 px, `npatpoint % 4 == 0`, still faults). The
+  `+=` on `dataout` for that vector also writes into the first pixels of the neighbouring
+  pattern while that work-item is accumulating its own output (a data race); the lanes
+  are masked to zero contribution but the read-modify-write still happens.
+
+Sizes that are a multiple of 16 (60x60, 120x120, 240x240, 480x480) are unaffected, which
+is presumably why this was never seen. Fix (tested, interior output identical to the
+numba result on 49x49, 50x50, 61x61, 95x97, 479x479): replace the casts with
+`vload16` / `vstore16` (they need only float alignment) and handle the partial last
+vector element-wise, zero-filling the load and storing only the valid lanes; the
+averaging pass can accumulate in a register and store once per vector instead of the
+per-neighbour `+=`. A complete patched copy of `clnlpar.cl` is attached / in the PR.
+
 **Two related observations, not bugs**
 
 - Border handling differs between the two engines (window shifted inward on the CPU,
@@ -85,17 +113,27 @@ Windows 11, Python 3.14. The line is unchanged in `main` as of 2026-10-13.
 
 ## PR title
 
-Fix neighbour sigma lookup in the OpenCL NLPAR kernel
+OpenCL NLPAR kernel: fix neighbour sigma lookup; support pattern sizes that are not a multiple of 16
 
 ## PR body
 
-`calcnlpar` in `clnlpar.cl` read `sigma[indx_xy]` (the centre pattern) for every
-neighbour in the weight loop; `indx_ij` was computed on the line above but not used.
-This made the weight normalisation `2*sigma_i^2` instead of `sigma_i^2 + sigma_j^2`, so
-GPU results diverged from the numba implementation wherever the noise level varies
-across the scan. One-line change to `sigma[indx_ij]`, matching `normd` in the same file
-and `nlpar_nb` in `nlpar_cpu.py`.
+Two fixes to `pyebsdindex/opencl/clnlpar.cl` (file in this repo: `patches/clnlpar_fixed.cl`):
 
-Verified on a synthetic two-noise-level scan: interior GPU output now equals the CPU
-output to within integer rounding (max diff 1 grey level, previously up to 119). Fixes
-#<issue number>.
+1. `calcnlpar` read `sigma[indx_xy]` (the centre pattern) for every neighbour in the
+   weight loop; `indx_ij` was computed on the line above but not used. This made the
+   weight normalisation `2*sigma_i^2` instead of `sigma_i^2 + sigma_j^2`, so GPU results
+   diverged from the numba implementation wherever the noise level varies across the
+   scan. Changed to `sigma[indx_ij]`, matching `normd` in the same file and `nlpar_nb`.
+2. `calcsigma` and `calcnlpar` read patterns through `*(__global float16*)` casts and
+   `calcnlpar` accumulated its output with a `+=` through the same cast. For pattern
+   sizes that are not a multiple of 16 pixels (e.g. 479x479) this is misaligned (faults
+   with INVALID_COMMAND_QUEUE on NVIDIA) and the last vector of each pattern overruns
+   into the next pattern / past the buffer, with a read-modify-write race on the
+   neighbour's first pixels. Replaced by `vload16`/`vstore16` plus element-wise handling
+   of the partial last vector; the averaging pass now accumulates in a register and
+   stores once per vector.
+
+Verified on synthetic scans: interior GPU output equals the numba output to within
+integer rounding (max 1 grey level) for 49x49, 50x50, 61x61, 95x97 and 479x479 patterns;
+previously 479x479 crashed and two-noise-level scans differed by up to 119 grey levels.
+Fixes #<issue number>.
