@@ -15,7 +15,7 @@ Every line was written through iterative LLM collaboration by someone who is not
 a software engineer. It is a personal research tool, not production software. It
 works on the author's data and machine. If it works on yours, great. If it
 breaks in some interesting new way, congratulations — you now know roughly as
-much about the internals as the author does.
+much about the internals as the author does. In fact, he didn't even write this readme.
 
 No warranties, no roadmap, no test suite, no design document. Just a tool that
 turned out to be useful enough to publish.
