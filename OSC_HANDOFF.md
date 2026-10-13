@@ -6,6 +6,31 @@ was done, what was verified, and what is deliberately NOT done yet.
 `OSC_SETUP.md` (from the original repo) is still the general Linux/OSC guide;
 this file is the delta on top of it.
 
+## v1.6.0.dev3 (2026-10-13): features pyebsdindex lacks, built around it (Phase 3)
+
+- **IQ-range exclusion in the batch, without touching pyebsdindex.** pyebsdindex has no
+  per-pattern mask. Excluded patterns are served to it as all-zero patterns (RamUPFile /
+  new MaskedUPFile `exclude` flag, set only for the duration of the batch) and their
+  sigma is set to 0 in the sigma array handed to calcnlpar (true sigma restored after).
+  For any real centre the normalised distance to a zero pattern is then enormous, so its
+  weight is exp(-huge) = 0: excluded patterns drop out as neighbours exactly as in the
+  legacy CuPy batch. Their own output is zeroed explicitly (`_zero_excluded_output`, RAM
+  or file). Verified on the synthetic scan, both engines: excluded outputs are 0, 17 of
+  19 direct neighbours of excluded patterns changed vs the unmasked batch (the other 2 had
+  ~0 weight already), and the preview (which skips excluded neighbours itself) matches
+  the exclusion-aware batch within 1 grey level; RAM and file results identical.
+- **pyebsdindex parameters in the panel**: "Saturation protect" (default on) and
+  "Distance threshold" (dthresh, default 0). Both go to opt_lambda, calcsigma, calcnlpar
+  and the preview; changing either invalidates sigma, the shared object and the lambda
+  gate. Verified: with saturation protect off and dthresh 0.5 the preview still matches
+  the batch within 1 grey level on both engines.
+- Scan borders: kept pyebsdindex's behaviour (numba shifts the window inward, OpenCL
+  mirrors). Documented, not changed.
+- Batch button now says which engine pyebsdindex resolved to.
+- `UPSTREAM_pyebsdindex_opencl_sigma_bug.md`: draft issue + PR text for the kernel bug,
+  not posted (Max decides).
+- Legacy CuPy batch kept (KPP_NLPAR_ENGINE=legacy) by Max's decision until the Phase 4 run.
+
 ## v1.6.0.dev2 (2026-10-13): sigma and aperture through pyebsdindex, preview aligned (Phase 2)
 
 Rule from Max (2026-10-13): use pyebsdindex modules wherever they exist; homebrew only

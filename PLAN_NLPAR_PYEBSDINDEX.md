@@ -98,12 +98,17 @@ clearly worth it, to be discussed later. Homebrew inventory in the viewer and it
   output within integer rounding on both engines; near saturated pixels it matches the
   engine it was aligned with; edge pixels may differ (documented).
 
-### Phase 3: features pyebsdindex lacks
-- IQ-range exclusion: short term, zero excluded patterns in the output after the batch
-  (they still contribute as neighbours). Proper fix: upstream patch adding an optional
-  per-pattern weight array to the pyebsdindex kernels (public domain, NRL); separate step.
-- Borders: accept mirroring (published behaviour).
-- Expose `saturation_protect` and `dthresh` as controls with pyebsdindex defaults.
+### Phase 3: features pyebsdindex lacks  (DONE 2026-10-13, v1.6.0.dev3)
+- IQ-range exclusion, implemented without changing pyebsdindex and with the legacy
+  semantics (excluded patterns neither averaged nor used as neighbours): the input file
+  object serves excluded patterns as zeros (`exclude` flag on RamUPFile / MaskedUPFile)
+  and their sigma is 0 in the array handed to calcnlpar, so their weight is exp(-huge) = 0;
+  outputs at excluded positions are zeroed explicitly. No upstream patch needed for this.
+- Borders: pyebsdindex behaviour accepted and documented (numba shifts inward, OpenCL
+  mirrors). Preview keeps zero-pad.
+- `saturation_protect` and `dthresh` exposed in the NLPAR panel with pyebsdindex
+  defaults, wired to lambda, sigma, batch and preview.
+- Upstream bug report drafted: UPSTREAM_pyebsdindex_opencl_sigma_bug.md (not posted).
 
 ### Phase 4: validation and docs
 - **OPEN DECISION: which pattern set to validate on is undecided.** Candidates on the
@@ -153,3 +158,7 @@ GPU mirrors) and the saturation threshold differs (0.999 vs 0.9961 of max).
   both engines: interior preview == batch within 1 grey level, 1-2 ms/click, sigma reused
   (1 ms), direct-click path computes sigma once and matches the post-Optimize-Lambda map.
   Still not run on real data; OSC untouched.
+- 2026-10-13: Phase 3 done on the laptop (v1.6.0.dev3): IQ-range exclusion via zero-served
+  patterns + sigma 0, saturation_protect / dthresh controls, upstream report drafted.
+  Synthetic-scan checks pass on both engines. Legacy CuPy batch kept until the Phase 4 run
+  (Max). Still not run on real data; OSC untouched.

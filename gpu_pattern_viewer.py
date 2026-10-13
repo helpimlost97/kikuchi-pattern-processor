@@ -1,4 +1,4 @@
-__version__ = "1.6.0.dev2"   # shown in the window title; bump with each release (git tag v<version>)
+__version__ = "1.6.0.dev3"   # shown in the window title; bump with each release (git tag v<version>)
 import sys
 import os
 import glob
@@ -332,6 +332,19 @@ class RamUPFile(ebsd_pattern.UPFile):
         super().__init__(path)
         self.read_header()
         self._ram = ram                      # (n_patterns, ph, pw) view, native dtype
+        self.exclude = None                  # optional (nPatterns,) bool: serve these as zeros
+
+    def _apply_exclude(self, pats, idx):
+        """Phase 3 IQ-range exclusion without touching pyebsdindex: excluded patterns are
+        served as all-zero patterns. Together with sigma = 0 at those positions (set by the
+        batch) their normalised distance to any real pattern is enormous, so their weight
+        is exp(-huge) = 0: they are dropped as neighbours. Their own output is the zero
+        pattern, which the batch zeroes anyway. See PLAN_NLPAR_PYEBSDINDEX.md, Phase 3."""
+        if self.exclude is not None:
+            sel = self.exclude[idx]
+            if sel.any():
+                pats[sel] = 0
+        return pats
 
     def _xyloc(self, idx):
         yx = np.unravel_index(idx.astype(np.uint64), (int(self.nRows), int(self.nCols)))
@@ -371,7 +384,39 @@ class RamUPFile(ebsd_pattern.UPFile):
                     if p1 > p0: pats[i * nc:i * nc + (p1 - p0)] = self._ram[p0:p1]
             idx = (np.arange(r0, r0 + nr, dtype=np.int64)[:, None] * ncols
                    + np.arange(c0, c0 + nc, dtype=np.int64)[None, :]).ravel()
-        return pats, self._xyloc(idx)
+        return self._apply_exclude(pats, idx), self._xyloc(idx)
+
+
+class MaskedUPFile(ebsd_pattern.UPFile):
+    """Streamed-mode twin of RamUPFile's exclusion: a real pyebsdindex UPFile whose
+    returnArrayOnly reads zero the patterns flagged in `exclude` (same contract as
+    RamUPFile._apply_exclude). Everything else is pyebsdindex's own file code."""
+    def __init__(self, path):
+        super().__init__(path)
+        self.read_header()
+        self.exclude = None
+
+    def read_data(self, path=None, convertToFloat=False, patStartCount=[0, -1], returnArrayOnly=False):
+        out = super().read_data(path=path, convertToFloat=convertToFloat,
+                                patStartCount=patStartCount, returnArrayOnly=returnArrayOnly)
+        if not returnArrayOnly or self.exclude is None:
+            return out
+        pats, xyloc = out
+        psc = np.asarray(patStartCount, dtype=np.int64)
+        ncols, nrows = int(self.nCols), int(self.nRows)
+        if psc.ndim == 1:
+            p0 = int(psc[0]); idx = np.arange(p0, p0 + pats.shape[0], dtype=np.int64)
+        else:
+            c0, nc = int(psc[0, 0]), int(psc[1, 0]); r0, nr = int(psc[0, 1]), int(psc[1, 1])
+            if nc < 0: nc = ncols - c0
+            if nr < 0: nr = nrows - r0
+            nc = min(nc, ncols - c0); nr = min(nr, nrows - r0)
+            idx = (np.arange(r0, r0 + nr, dtype=np.int64)[:, None] * ncols
+                   + np.arange(c0, c0 + nc, dtype=np.int64)[None, :]).ravel()[:pats.shape[0]]
+        sel = self.exclude[idx]
+        if sel.any():
+            pats = np.array(pats, copy=True); pats[sel] = 0
+        return pats, xyloc
 
 
 class RamOutUPFile(RamUPFile):
@@ -421,6 +466,7 @@ class MainWindow(QMainWindow):
         # pyebsdindex NLPAR object shared by Optimize Lambda and the batch (sigma reuse);
         # keyed on (path, aperture, rows). See _get_nlobj.
         self._nlobj = None; self._nlobj_key = None; self._nlobj_from_ram = False
+        self._nl_infile = None               # the object's input file (RamUPFile / MaskedUPFile)
         self.nrows = self.ncols = self.current_row = self.current_col = 0
         self.mean_pattern = None; self.iq_map = None; self.iq_mask = None
         self.pixel_std = None  # per-pixel std across dataset, for variance-based aperture detection
@@ -779,9 +825,12 @@ class MainWindow(QMainWindow):
         # Aperture mask (canonical paper notation N_p = number of active pixels).
         aperture_2d, aperture_count, _ = self._resolve_aperture_mask(ph, pw)
         ap_flat = (aperture_2d.ravel() > 0) if aperture_2d is not None else np.ones(ph * pw, dtype=bool)
-        # pyebsdindex saturation rule, engine-specific factor on the tile max (here: data max).
+        # pyebsdindex saturation rule, engine-specific factor on the tile max (here: data max);
+        # off -> threshold above any value (pyebsdindex uses max+1). dthresh as in the kernels.
+        params = self._nlpar_params()
         data_max = float(self.data_max) if getattr(self, 'data_max', None) else float(np.max(pats))
-        sat_thresh = data_max * (0.9961 if NLPAR_ON_GPU else 0.999)
+        sat_thresh = data_max * (0.9961 if NLPAR_ON_GPU else 0.999) if params['saturation_protect'] else np.inf
+        dthresh = params['dthresh']
 
         # σ² of the center pixel and the corresponding neighborhood slice in sigma_sq_map.
         n_avail_rows = getattr(self, 'n_actual_rows', self.nrows)
@@ -815,7 +864,7 @@ class MainWindow(QMainWindow):
                     w = 0.0
                 else:
                     d_norm = (d_raw - n * sigma_combined) / (sigma_combined * np.sqrt(2.0 * n))
-                    d_clipped = max(d_norm, 0.0)
+                    d_clipped = max(d_norm - dthresh, 0.0)
                     w = np.exp(-d_clipped / lam_sq)
                 weighted_sum += w * nb_pat
                 weight_total += w
@@ -870,8 +919,8 @@ class MainWindow(QMainWindow):
             # Both engines return (sigma, dist, count). calcsigma_cl also stores sigma on the
             # object, calcsigma_cpu does not (only opt_lambda_cpu does), so store it here so
             # the batch reuses it either way.
-            sig = np.asarray(nlobj.calcsigma(nn=1, saturation_protect=True, automask=False,
-                                             chunksize=self._nlpar_chunk_bytes())[0])
+            sig = np.asarray(nlobj.calcsigma(nn=1, automask=False, chunksize=self._nlpar_chunk_bytes(),
+                                             saturation_protect=self._nlpar_params()['saturation_protect'])[0])
             nlobj.sigma = sig
         sigma_sq = np.zeros((int(self.nrows), int(self.ncols)), dtype=np.float32)
         sigma_sq[:sig.shape[0], :sig.shape[1]] = sig.astype(np.float32) ** 2
@@ -908,13 +957,41 @@ class MainWindow(QMainWindow):
             # forces fID.nRows = self.nrows whenever self.nrows is not None.
             if n_avail < self.nrows:
                 nlobj.nrows = n_avail
-            from_ram = self._serve_nlpar_from_ram(nlobj)
+            from_ram = self._serve_nlpar_input(nlobj)
             ap = self._current_aperture()
             nlobj.mask = (ap > 0).astype(np.uint8) if ap is not None else None
             self._nlobj, self._nlobj_key, self._nlobj_from_ram = nlobj, key, from_ram
         nlobj = self._nlobj
         nlobj.searchradius = int(sr)
         return nlobj, self._nlobj_from_ram
+
+    # pyebsdindex parameters exposed in the NLPAR panel (Phase 3). Both feed sigma / lambda
+    # / batch / preview alike; changing either invalidates sigma, the shared object and
+    # the lambda gate (sigma depends on saturation_protect, the lambda fit on dthresh).
+    def _nlpar_params(self):
+        """dict(saturation_protect=bool, dthresh=float) from the panel."""
+        return dict(saturation_protect=bool(self.sat_chk.isChecked()),
+                    dthresh=float(self.dthresh_spin.value()))
+
+    def _on_nlpar_param_changed(self):
+        self._invalidate_sigma_map()
+        self._lambda_optimized = False
+        self._nlobj = None; self._nlobj_key = None
+        if self.f_orig is not None:
+            self.update_display()
+
+    def _nlpar_exclusion(self):
+        """(nPatterns,) bool of patterns the IQ range excludes, or None if none.
+        Only whole recorded rows count (as everywhere else in the batch)."""
+        mask = self._get_iq_mask()
+        if mask is None or mask.all():
+            return None
+        n_avail = int(getattr(self, 'n_actual_rows', self.nrows)); ncols = int(self.ncols)
+        n_pat = int(getattr(self, 'n_actual_pats', n_avail * ncols))
+        excl = np.zeros(n_pat, dtype=bool)
+        m = ~np.asarray(mask, dtype=bool)[:n_avail].ravel()
+        excl[:min(m.size, n_pat)] = m[:n_pat]
+        return excl if excl.any() else None
 
     def _nlobj_mask_info(self, nlobj):
         """(N_p, label) for console / status messages."""
@@ -991,22 +1068,26 @@ class MainWindow(QMainWindow):
         nlobj.getinfileobj, nlobj.getoutfileobj = infile, outfile
         return lambda: show(force=True)
 
-    def _serve_nlpar_from_ram(self, nlobj):
-        """Make a pyebsdindex NLPAR object read the scan from self.patterns instead of
-        re-reading the file (no-op when the dataset is streamed). Mirrors what
-        NLPAR.getinfileobj() does with nrows/ncols so a capped row count (map stopped
-        early) still applies."""
-        if self.patterns is None:
-            return False
-        ram = RamUPFile(self.orig_path, self.patterns)
+    def _serve_nlpar_input(self, nlobj):
+        """Give a pyebsdindex NLPAR object its input file object: RamUPFile serving
+        self.patterns when the dataset is in RAM (no re-read of the file), else a
+        MaskedUPFile on the original path. Both carry the Phase 3 `exclude` flag the
+        batch uses for the IQ-range exclusion; the object is kept as self._nl_infile so
+        the batch can set it. Mirrors what NLPAR.getinfileobj() does with nrows/ncols so a
+        capped row count (map stopped early) still applies. Returns from_ram."""
+        from_ram = self.patterns is not None
+        fobj = RamUPFile(self.orig_path, self.patterns) if from_ram else MaskedUPFile(self.orig_path)
         def infile():
-            if nlobj.nrows is None: nlobj.nrows = ram.nRows
-            else: ram.nRows = nlobj.nrows
-            if nlobj.ncols is None: nlobj.ncols = ram.nCols
-            else: ram.nCols = nlobj.ncols
-            return ram
+            if nlobj.nrows is None: nlobj.nrows = fobj.nRows
+            else: fobj.nRows = nlobj.nrows
+            if nlobj.ncols is None: nlobj.ncols = fobj.nCols
+            else: fobj.nCols = nlobj.ncols
+            return fobj
         nlobj.getinfileobj = infile
-        return True
+        self._nl_infile = fobj
+        return from_ram
+
+    _serve_nlpar_from_ram = _serve_nlpar_input          # old name
 
     def _alloc_nlpar_ram(self, tag="[CPU NLPAR]"):
         """Allocate self.nlpar_patterns, the in-RAM NLPAR batch result (same shape and
@@ -1707,7 +1788,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"Optimizing lambda (aperture={ap_label}, N_p={N_p})..."); QApplication.processEvents()
             self._hook_nlpar_progress(nlobj, "Optimize lambda (sigma pass)", n_avail * int(self.ncols))
-            nlobj.opt_lambda(chunksize=budget, automask=False, autoupdate=True, backsub=False)
+            nlobj.opt_lambda(chunksize=budget, automask=False, autoupdate=True, backsub=False,
+                             **self._nlpar_params())
             self.lam_spin.setValue(float(nlobj.lam))
             self._lambda_optimized = True
             elapsed = time.time() - t0
@@ -2018,10 +2100,39 @@ class MainWindow(QMainWindow):
                   f"source={'RAM' if from_ram else 'file'} -> {'RAM' if to_ram else out_path}")
             finish = self._hook_nlpar_progress(nlobj, f"NLPAR batch ({label})", n_avail * int(self.ncols))
             kw = dict(chunksize=budget, lam=float(lam), searchradius=int(sr),
-                      saturation_protect=True, automask=False, backsub=False)
+                      automask=False, backsub=False, **self._nlpar_params())
+            # IQ-range exclusion (Phase 3): excluded patterns are served to pyebsdindex as
+            # zero patterns with sigma 0, which gives them zero weight as neighbours (see
+            # RamUPFile._apply_exclude); their own output is zeroed below. The true sigma
+            # map is put back afterwards so preview / lambda keep using it.
+            excl = self._nlpar_exclusion()
+            if excl is not None and (nlobj.sigma is None or np.asarray(nlobj.sigma).ndim != 2):
+                # Sigma must come from the real patterns, not from the zero-served ones
+                # (a zero pattern next to real ones would get a huge sigma and, through
+                # the normalisation, full weight). Normally Optimize Lambda already did this.
+                self._ensure_sigma_map()
+            true_sigma = nlobj.sigma
+            if excl is not None:
+                print(f"[NLPAR {label}] IQ range excludes {int(excl.sum())} of {excl.size} patterns "
+                      f"(served as zero patterns, sigma 0, output zeroed)")
+                self._nl_infile.exclude = excl
+                if true_sigma is not None and np.asarray(true_sigma).ndim == 2:
+                    s = np.array(true_sigma, dtype=np.float32, copy=True)
+                    keep = ~excl[:s.size].reshape(-1)
+                    s.reshape(-1)[:keep.size] *= keep.astype(np.float32)
+                    nlobj.sigma = s
+            try:
+                if to_ram:
+                    nlobj.calcnlpar(**kw)
+                else:
+                    result_path = nlobj.calcnlpar(fileout=out_path, **kw)
+            finally:
+                self._nl_infile.exclude = None
+                nlobj.sigma = true_sigma
+            finish()
+            if excl is not None and (to_ram or (result_path and os.path.isfile(result_path))):
+                self._zero_excluded_output(excl, self.nlpar_patterns if to_ram else result_path, ph, pw)
             if to_ram:
-                nlobj.calcnlpar(**kw)
-                finish()
                 elapsed = time.time() - t0
                 self.f_nlpar = RamUPFile(self.orig_path, self.nlpar_patterns)
                 self.nlpar_chk.setChecked(False)
@@ -2030,8 +2141,6 @@ class MainWindow(QMainWindow):
                 print(f"[NLPAR {label}] done in {elapsed:.1f}s -> RAM")
                 self.update_display()
                 return
-            result_path = nlobj.calcnlpar(fileout=out_path, **kw)
-            finish()
             elapsed = time.time() - t0
             if not (result_path and os.path.isfile(result_path)):
                 base = os.path.splitext(self.orig_path)[0]
@@ -2055,6 +2164,24 @@ class MainWindow(QMainWindow):
 
     # Old name, still used by osc_selftest.py / osc_gpu_selftest.py (rewritten in Phase 4).
     _apply_nlpar_cpu = _apply_nlpar_pyebsdindex
+
+    def _zero_excluded_output(self, excl, target, ph, pw):
+        """Write zero patterns at the excluded positions of the batch result. `target` is
+        the in-RAM result array or the path of the result file. The kernel already
+        produces (near-)zero patterns there (zero centre with weight 1, neighbours at
+        exp(-huge)); this makes it exact and independent of lambda."""
+        idx = np.flatnonzero(excl)
+        if idx.size == 0:
+            return
+        if isinstance(target, np.ndarray):
+            target[idx] = 0
+            return
+        fobj = ebsd_pattern.get_pattern_file_obj(target)
+        # group consecutive indices into runs -> one write_data per run
+        breaks = np.flatnonzero(np.diff(idx) != 1) + 1
+        for run in np.split(idx, breaks):
+            z = np.zeros((run.size, ph, pw), dtype=fobj.filedatatype)
+            fobj.write_data(newpatterns=z, patStartCount=[int(run[0]), int(run.size)], writeHead=False)
 
     def apply_and_save(self):
         """Save all processed patterns to a new UP1/UP2 file (chunked). The output keeps
@@ -2311,8 +2438,21 @@ class MainWindow(QMainWindow):
         self.lam_spin.valueChanged.connect(self.update_display)
         gl.addRow(self.nlpar_chk)
         gl.addRow("Search Radius:", self.sr_spin); gl.addRow("Lambda:", self.lam_spin)
+        # pyebsdindex parameters (Phase 3): saturation_protect drops near-saturated pixel pairs
+        # from the distance (default on, pyebsdindex default); dthresh is subtracted from the
+        # normalised dissimilarity before the exponent (default 0 = off, pyebsdindex default).
+        self.sat_chk = QCheckBox("Saturation protect (pyebsdindex)"); self.sat_chk.setChecked(True)
+        self.sat_chk.setToolTip("Drop pixel pairs where either value is at/above ~max intensity from the "
+                                "NLPAR distance and the sigma estimate (pyebsdindex saturation_protect).")
+        self.sat_chk.toggled.connect(lambda *_: self._on_nlpar_param_changed())
+        self.dthresh_spin = QDoubleSpinBox(); self.dthresh_spin.setRange(0.0, 100.0)
+        self.dthresh_spin.setValue(0.0); self.dthresh_spin.setSingleStep(0.1); self.dthresh_spin.setDecimals(2)
+        self.dthresh_spin.setToolTip("pyebsdindex dthresh: subtracted from the normalised dissimilarity before "
+                                     "the exponent, so pairs below it count as identical. 0 = off.")
+        self.dthresh_spin.valueChanged.connect(lambda *_: self._on_nlpar_param_changed())
+        gl.addRow(self.sat_chk); gl.addRow("Distance threshold:", self.dthresh_spin)
         b1 = QPushButton("Optimize Lambda"); b1.clicked.connect(self.optimize_lambda)
-        b2 = QPushButton("Apply NLPAR to Full Dataset (GPU)" if HAS_GPU else "Apply NLPAR to Full Dataset (CPU)"); b2.clicked.connect(self.apply_nlpar_batch)
+        b2 = QPushButton(f"Apply NLPAR to Full Dataset ({'GPU' if NLPAR_ON_GPU else 'CPU'}, pyebsdindex)"); b2.clicked.connect(self.apply_nlpar_batch)
         b3 = QPushButton("Load Existing NLPAR UP1/UP2"); b3.clicked.connect(self.load_nlpar_file)
         gl.addRow(b1); gl.addRow(b2); gl.addRow(b3)
         self.nlpar_status = QLabel("No NLPAR file loaded"); gl.addRow(self.nlpar_status); cl.addWidget(g)

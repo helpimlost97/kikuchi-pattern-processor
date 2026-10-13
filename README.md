@@ -48,6 +48,13 @@ turned out to be useful enough to publish.
     scan border where pyebsdindex shifts or mirrors the window)
   - σ map and **Optimize λ** come from `pyebsdindex.nlpar.NLPAR.calcsigma` /
     `opt_lambda` on one shared object, so σ is computed once per aperture
+  - **IQ-range exclusion** carries into the batch: patterns outside the IQ range
+    are neither averaged nor used as neighbours (served to pyebsdindex as zero
+    patterns with σ = 0, which gives them zero weight) and come out as zeros
+  - pyebsdindex's `saturation_protect` and `dthresh` are exposed in the panel
+    with their defaults (on, 0) and apply to σ, λ, batch and preview alike
+  - Scan borders follow pyebsdindex: the CPU kernel shifts the window inward at
+    edges, the OpenCL kernel mirrors indices; the preview zero-pads
   - The pre-1.6 CuPy shift-and-compare batch is still in the file behind
     `KPP_NLPAR_ENGINE=legacy` for comparison and will be removed
 - **NPAR** as a uniform-weight special case (single-pixel preview only;
