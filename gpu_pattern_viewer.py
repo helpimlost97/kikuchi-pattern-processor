@@ -1,4 +1,4 @@
-__version__ = "1.6.0.dev1"   # shown in the window title; bump with each release (git tag v<version>)
+__version__ = "1.6.0.dev2"   # shown in the window title; bump with each release (git tag v<version>)
 import sys
 import os
 import glob
@@ -465,21 +465,10 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _make_aperture_mask(h, w):
-        """Aperture mask matching pyebsdindex's NLPAR.makeautomask exactly.
-        Inscribed circle of radius 0.98*min(h,w)/2, centered via np.roll trick.
-        Source: pyebsdindex/nlpar_cpu.py (David Rowenhorst, NRL - public domain).
-        Disable for non-circular detector geometries (e.g. RKD)."""
-        r = (min(h, w) * 0.98 * 0.5)
-        x = np.arange(w, dtype=np.float32)
-        x = np.minimum(x, (w - x))
-        x = x.reshape(1, w)
-        y = np.arange(h, dtype=np.float32)
-        y = np.minimum(y, (h - y))
-        y = y.reshape(h, 1)
-        mask = np.sqrt(y ** 2 + x ** 2)
-        mask = (mask < r).astype(np.uint8)
-        mask = np.roll(mask, (int(h / 2), int(w / 2)), axis=(0, 1))
-        return mask
+        """Circular aperture = pyebsdindex's own NLPAR.makeautomask (inscribed circle of
+        radius 0.98*min(h,w)/2). Was a verbatim copy until Phase 2 (PLAN_NLPAR_PYEBSDINDEX.md);
+        calling theirs keeps the two in step. Disable for non-circular geometries (RKD)."""
+        return np.asarray(nlpar.NLPAR.makeautomask(int(h), int(w)), dtype=np.uint8)
 
     def _make_variance_mask(self, threshold_frac=0.05):
         """Auto-detect active detector pixels from per-pixel std across the dataset.
@@ -764,6 +753,19 @@ class MainWindow(QMainWindow):
         With this normalization, λ is dimensionless and canonical values are 0.5–2.0
         (opt_lambda typically returns ~0.6–1.2). λ → ∞ recovers NPAR; λ → 0 recovers
         the identity (no smoothing).
+
+        Kept as our own NumPy code by decision (Max, 2026-10-13; PLAN_NLPAR_PYEBSDINDEX.md):
+        it is the fast interactive preview. Two things are aligned with pyebsdindex's batch
+        kernel so interior pixels come out the same (Phase 2):
+          * σ² comes from pyebsdindex's calcsigma (see _ensure_sigma_map);
+          * saturation_protect: a pixel pair where either value is at/above the saturation
+            threshold is dropped from d, and N_p becomes the per-pair count n of surviving
+            aperture pixels. pyebsdindex takes the threshold from the max of the tile it is
+            processing (numba: 0.999*max, OpenCL: 0.9961*max); here the dataset max stands
+            in for the tile max, which is the same number for any scan with a saturated
+            pixel somewhere.
+        Scan borders stay ours: missing neighbours are simply absent (zero-pad), where
+        pyebsdindex's numba kernel shifts the window inward and its OpenCL kernel mirrors.
         """
         sr = self.sr_spin.value()
         lam = self.lam_spin.value()
@@ -774,10 +776,12 @@ class MainWindow(QMainWindow):
         ph, pw = center_pat.shape
         nr, nc = pats.shape[0], pats.shape[1]
 
-        # Aperture mask + active-pixel count N_p (canonical paper notation).
+        # Aperture mask (canonical paper notation N_p = number of active pixels).
         aperture_2d, aperture_count, _ = self._resolve_aperture_mask(ph, pw)
-        N_p = float(aperture_count)
-        ap_flat = aperture_2d.ravel().astype(np.float64) if aperture_2d is not None else None
+        ap_flat = (aperture_2d.ravel() > 0) if aperture_2d is not None else np.ones(ph * pw, dtype=bool)
+        # pyebsdindex saturation rule, engine-specific factor on the tile max (here: data max).
+        data_max = float(self.data_max) if getattr(self, 'data_max', None) else float(np.max(pats))
+        sat_thresh = data_max * (0.9961 if NLPAR_ON_GPU else 0.999)
 
         # σ² of the center pixel and the corresponding neighborhood slice in sigma_sq_map.
         n_avail_rows = getattr(self, 'n_actual_rows', self.nrows)
@@ -789,26 +793,28 @@ class MainWindow(QMainWindow):
         weighted_sum = np.zeros((ph, pw), dtype=np.float64)
         weight_total = 0.0
         lam_sq = lam * lam
-        sqrt_2Np = np.sqrt(2.0 * N_p)
         center_flat = center_pat.ravel()
+        center_ok = ap_flat & (center_flat < sat_thresh)
 
         for ri in range(nr):
             for ci in range(nc):
                 if not mask[ri, ci]:
                     continue
                 nb_pat = pats[ri, ci].astype(np.float64)
-                diff = nb_pat.ravel() - center_flat
-                if ap_flat is not None:
-                    d_raw = float(np.sum(diff * diff * ap_flat))
-                else:
-                    d_raw = float(np.dot(diff, diff))
+                nb_flat = nb_pat.ravel()
+                valid = center_ok & (nb_flat < sat_thresh)        # per-pair pixel set
+                n = float(valid.sum())
+                diff = (nb_flat - center_flat)[valid]
+                d_raw = float(np.dot(diff, diff))
                 sigma_sq_j = float(sigma_sq_nb[ri, ci])
                 sigma_combined = sigma_sq_i + sigma_sq_j
-                if sigma_combined < 1e-10:
-                    # Degenerate σ² → weight only the center pattern.
-                    w = 1.0 if (ri == cr and ci == cc) else 0.0
+                if ri == cr and ci == cc:
+                    w = 1.0                                        # self-pair, as in both kernels
+                elif sigma_combined < 1e-10 or n < 1.0:
+                    # Degenerate σ² (or no comparable pixels) → this neighbour gets no weight.
+                    w = 0.0
                 else:
-                    d_norm = (d_raw - N_p * sigma_combined) / (sqrt_2Np * sigma_combined)
+                    d_norm = (d_raw - n * sigma_combined) / (sigma_combined * np.sqrt(2.0 * n))
                     d_clipped = max(d_norm, 0.0)
                     w = np.exp(-d_clipped / lam_sq)
                 weighted_sum += w * nb_pat
@@ -834,174 +840,52 @@ class MainWindow(QMainWindow):
         self._sigma_aperture_key = None
 
     def _ensure_sigma_map(self):
-        """Compute σ² map for the current aperture if not already cached.
-        σ²_i is estimated from the minimum d² to the 8 nearest neighbors (Eq. 9):
-            σ̂²_i = min_{j ∈ SR=1}( d(p_i, p_j) / (2 N_p) )
-        where d is the squared Euclidean distance summed over the aperture pixels.
-        """
+        """σ² map for the current aperture, from pyebsdindex (Phase 2).
+
+        pyebsdindex's calcsigma (OpenCL or numba, whichever engine was resolved) is the
+        same estimate as before, Brewick et al. 2019 Eq. 9 over the 8 nearest neighbours,
+            σ̂_i = sqrt( min_j d(p_i, p_j) / (2 n_ij) ),
+        except that n_ij is the per-pair count of aperture pixels that are below the
+        saturation threshold in both patterns (saturation_protect), where we used the
+        fixed aperture count. The map lives on the shared NLPAR object (_get_nlobj):
+        Optimize Lambda computes it through the very same call, so after Optimize Lambda
+        this is free and the first preview click is instant; otherwise the one-time pass
+        happens here. self.sigma_sq_map = σ² as (nrows, ncols) float32; rows a truncated
+        map never recorded are 0 (the preview gives such neighbours zero weight)."""
         key = self._aperture_key()
         if self.sigma_sq_map is not None and self._sigma_aperture_key == key:
             return
-        self.statusBar().showMessage("Computing σ² map for canonical NLPAR (one-time per aperture)...")
-        QApplication.processEvents()
         t0 = time.time()
-        ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
-        aperture_2d, aperture_count, ap_label = self._resolve_aperture_mask(ph, pw)
-        N_p = float(aperture_count)
-        if HAS_GPU:
-            self.sigma_sq_map = self._compute_sigma_map_gpu(aperture_2d, N_p)
-        else:
-            self.sigma_sq_map = self._compute_sigma_map_cpu(aperture_2d, N_p)
+        nlobj, from_ram = self._get_nlobj(self.sr_spin.value())
+        n_avail = int(getattr(self, 'n_actual_rows', self.nrows))
+        sig = None if nlobj.sigma is None else np.asarray(nlobj.sigma)
+        if sig is None or sig.ndim != 2 or sig.shape != (n_avail, int(self.ncols)):
+            N_p, ap_label = self._nlobj_mask_info(nlobj)
+            print(f"[σ² MAP] engine={NLPAR_ENGINE} aperture={ap_label} N_p={N_p} "
+                  f"rows={n_avail}/{self.nrows} source={'RAM' if from_ram else 'file'}")
+            self.statusBar().showMessage(f"Computing σ map with {NLPAR_ENGINE} (one-time per aperture)...")
+            QApplication.processEvents()
+            self._unhook_nlpar_progress(nlobj)
+            self._hook_nlpar_progress(nlobj, "σ map (pyebsdindex)", n_avail * int(self.ncols))
+            # Both engines return (sigma, dist, count). calcsigma_cl also stores sigma on the
+            # object, calcsigma_cpu does not (only opt_lambda_cpu does), so store it here so
+            # the batch reuses it either way.
+            sig = np.asarray(nlobj.calcsigma(nn=1, saturation_protect=True, automask=False,
+                                             chunksize=self._nlpar_chunk_bytes())[0])
+            nlobj.sigma = sig
+        sigma_sq = np.zeros((int(self.nrows), int(self.ncols)), dtype=np.float32)
+        sigma_sq[:sig.shape[0], :sig.shape[1]] = sig.astype(np.float32) ** 2
+        self.sigma_sq_map = sigma_sq
         self._sigma_aperture_key = key
+        N_p, ap_label = self._nlobj_mask_info(nlobj)
         # Diagnostic summary so we can sanity-check σ values vs. raw pattern intensity scale.
         valid = self.sigma_sq_map[self.sigma_sq_map > 0]
         if len(valid) > 0:
             med = float(np.median(valid)); lo = float(np.percentile(valid, 5)); hi = float(np.percentile(valid, 95))
-            print(f"[σ² MAP] aperture={ap_label} N_p={int(N_p)} "
+            print(f"[σ² MAP] {NLPAR_ENGINE}, aperture={ap_label} N_p={int(N_p)} "
                   f"σ²: median={med:.3g}, 5–95%=[{lo:.3g}, {hi:.3g}], "
                   f"σ (intensity units): median={np.sqrt(med):.3g}, time={time.time()-t0:.1f}s")
         self.statusBar().showMessage(f"σ² map ready ({time.time()-t0:.1f}s)")
-
-    def _compute_sigma_map_gpu(self, aperture_2d, N_p):
-        """GPU σ² estimation. SR=1 (8 nearest neighbors), one shift-and-compare pass."""
-        ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
-        sr = 1
-        g_aperture = cp.asarray(aperture_2d) if aperture_2d is not None else None
-        sigma_sq_map = np.zeros((self.nrows, self.ncols), dtype=np.float32)
-        n_avail = getattr(self, 'n_actual_rows', self.nrows)
-
-        # Memory budget: same shape as main NLPAR pass but with sr=1, so fits easily.
-        pat_bytes = ph * pw * 4
-        mem_per_row = 5 * (self.ncols + 2 * sr) * pat_bytes
-        vram_budget = int(cp.cuda.Device(0).mem_info[1] * 0.5)
-        CHUNK_ROWS = max(2, vram_budget // mem_per_row)
-        CHUNK_ROWS = min(CHUNK_ROWS, self.nrows)
-        # Host RAM caps this too (an 8.5 GB GPU on a 33 GB host, or a 94 GB H100 on a wide
-        # scan, can pick a chunk that fits VRAM but not RAM). Live on the host at the peak,
-        # i.e. while `padded` is filled: the float32 read (4 B/px; a file read's native
-        # uint8/16 buffer is already gone by then) + the float32 `padded` block (4 B/px)
-        # = 8 B/px, charged on the padded (rows+2) x (ncols+2) grid. valid/σ² are per
-        # pattern, not per pixel. After upload the host holds only the σ² row block.
-        CHUNK_ROWS = min(CHUNK_ROWS, self._host_padded_chunk_rows(8, sr))
-
-        for chunk_start in range(0, n_avail, CHUNK_ROWS):
-            chunk_rows = min(CHUNK_ROWS, n_avail - chunk_start)
-            read_r0 = max(0, chunk_start - sr)
-            read_r1 = min(n_avail, chunk_start + chunk_rows + sr)
-            data_np = self._read_rows(self.f_orig, read_r0, read_r1 - read_r0, as_float=True)
-            # copy=False: read_data already returned float32, don't duplicate the block.
-            data_np = data_np.reshape(read_r1 - read_r0, self.ncols, ph, pw).astype(np.float32, copy=False)
-
-            full_h = chunk_rows + 2 * sr
-            full_w = self.ncols + 2 * sr
-            padded = np.zeros((full_h, full_w, ph, pw), dtype=np.float32)
-            valid = np.zeros((full_h, full_w), dtype=bool)
-            dst_r0 = sr - (chunk_start - read_r0)
-            dst_r1 = dst_r0 + (read_r1 - read_r0)
-            padded[dst_r0:dst_r1, sr:sr+self.ncols, :, :] = data_np
-            valid[dst_r0:dst_r1, sr:sr+self.ncols] = True
-            del data_np
-
-            g_padded = cp.asarray(padded); g_valid = cp.asarray(valid)
-            del padded, valid
-            center = g_padded[sr:sr+chunk_rows, sr:sr+self.ncols, :, :]
-            min_d_raw = cp.full((chunk_rows, self.ncols), cp.inf, dtype=cp.float32)
-
-            for dr in range(-sr, sr + 1):
-                for dc in range(-sr, sr + 1):
-                    if dr == 0 and dc == 0:
-                        continue
-                    nb = g_padded[sr+dr:sr+dr+chunk_rows, sr+dc:sr+dc+self.ncols, :, :]
-                    nb_valid = g_valid[sr+dr:sr+dr+chunk_rows, sr+dc:sr+dc+self.ncols]
-                    diff = center - nb
-                    if g_aperture is not None:
-                        d_raw = (diff * diff * g_aperture).reshape(chunk_rows, self.ncols, -1).sum(axis=2)
-                    else:
-                        d_raw = (diff * diff).reshape(chunk_rows, self.ncols, -1).sum(axis=2)
-                    d_raw = cp.where(nb_valid, d_raw, cp.inf)
-                    min_d_raw = cp.minimum(min_d_raw, d_raw)
-                    del diff, d_raw, nb, nb_valid
-
-            # σ²_i = min_d_raw / (2 N_p)  (Eq. 9)
-            sigma_sq_chunk = min_d_raw / (2.0 * N_p)
-            sigma_sq_chunk = cp.where(cp.isfinite(sigma_sq_chunk), sigma_sq_chunk, 0.0)
-            sigma_sq_map[chunk_start:chunk_start+chunk_rows, :] = cp.asnumpy(sigma_sq_chunk)
-            del g_padded, g_valid, min_d_raw, sigma_sq_chunk
-            cp.get_default_memory_pool().free_all_blocks()
-
-            self.statusBar().showMessage(f"σ² map: row {chunk_start+chunk_rows}/{n_avail}")
-            QApplication.processEvents()
-
-        # Patch isolated/invalid σ²=0 pixels with the dataset median to avoid div-by-zero downstream.
-        valid_sigmas = sigma_sq_map[sigma_sq_map > 0]
-        if len(valid_sigmas) > 0:
-            med = float(np.median(valid_sigmas))
-            sigma_sq_map[sigma_sq_map <= 0] = med
-        return sigma_sq_map
-
-    def _compute_sigma_map_cpu(self, aperture_2d, N_p):
-        """CPU σ² estimation, vectorized per scan row and threaded across rows.
-
-        Same quantity as before (min over the 8 neighbours of the aperture-weighted SSD,
-        divided by 2·N_p): patterns are uint8/uint16 so the float32 differences are exact
-        (their squares too for uint8; for uint16 they carry float32 rounding, ~1e-7
-        relative), and the sums accumulate in float64 as the old loop did. Each
-        (row, neighbour offset) is one array op over all columns instead of a Python loop
-        over patterns, and the rows of a chunk are spread over a thread pool (numpy
-        releases the GIL in these ops)."""
-        ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
-        npix = ph * pw
-        ncols = int(self.ncols)  # pyebsdindex gives numpy uint64; keep index math in Python ints
-        sigma_sq_map = np.zeros((int(self.nrows), ncols), dtype=np.float32)
-        ap_flat = aperture_2d.ravel().astype(np.float32) if aperture_2d is not None else None
-        n_avail = getattr(self, 'n_actual_rows', self.nrows)
-        # Live host memory: float32 chunk (4 B/px) + per-thread temporaries of ~2 rows of
-        # float32 (the diff and its square). Cap threads so the temporaries fit too.
-        row_bytes = ncols * npix * 4
-        nthr = int(max(1, min(n_workers(), (0.25 * available_ram()) // (2 * row_bytes))))
-        CHUNK_ROWS = self._host_chunk_rows(4, n_rows_total=max(n_avail, 1))
-        print(f"[SIGMA MAP CPU] CHUNK_ROWS: {CHUNK_ROWS} of {n_avail} rows, {nthr} threads")
-        offsets = [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if (dr, dc) != (0, 0)]
-
-        def row_min_ssd(data, lr):
-            A = data[lr]                                    # (ncols, npix) float32
-            best = np.full(ncols, np.inf, dtype=np.float64)
-            for dr, dc in offsets:
-                lr2 = lr + dr
-                if lr2 < 0 or lr2 >= data.shape[0]:
-                    continue
-                c0, c1 = max(0, -dc), ncols - max(0, dc)    # centre columns whose neighbour exists
-                if c1 <= c0:
-                    continue
-                diff = data[lr2, c0 + dc:c1 + dc] - A[c0:c1]
-                np.multiply(diff, diff, out=diff)
-                if ap_flat is not None:
-                    d = np.einsum('ij,j->i', diff, ap_flat, dtype=np.float64)
-                else:
-                    d = diff.sum(axis=1, dtype=np.float64)
-                np.minimum(best[c0:c1], d, out=best[c0:c1])
-            return best
-
-        with ThreadPoolExecutor(max_workers=nthr) as pool:
-            for chunk_start in range(0, n_avail, CHUNK_ROWS):
-                chunk_rows = min(CHUNK_ROWS, n_avail - chunk_start)
-                read_r0 = max(0, chunk_start - 1)
-                read_r1 = min(n_avail, chunk_start + chunk_rows + 1)
-                data = self._read_rows(self.f_orig, read_r0, read_r1 - read_r0, as_float=True)
-                data = data.reshape(read_r1 - read_r0, ncols, npix)
-                if data.dtype != np.float32:
-                    data = data.astype(np.float32)
-                local_rows = [r + (chunk_start - read_r0) for r in range(chunk_rows)]
-                for r, best in enumerate(pool.map(lambda lr: row_min_ssd(data, lr), local_rows)):
-                    sigma_sq_map[chunk_start + r] = np.where(np.isfinite(best), best / (2.0 * N_p), 0.0)
-                del data
-                self.statusBar().showMessage(f"σ² map (CPU): row {chunk_start+chunk_rows}/{n_avail}")
-                QApplication.processEvents()
-        valid_sigmas = sigma_sq_map[sigma_sq_map > 0]
-        if len(valid_sigmas) > 0:
-            med = float(np.median(valid_sigmas))
-            sigma_sq_map[sigma_sq_map <= 0] = med
-        return sigma_sq_map
 
     # ---- Base pattern retrieval (on-demand) ----
     # ------------------------------------------------------------------

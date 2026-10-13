@@ -147,3 +147,9 @@ GPU mirrors) and the saturation threshold differs (0.999 vs 0.9961 of max).
   shared NLPAR object with sigma reuse, progress hook, legacy engine behind
   KPP_NLPAR_ENGINE=legacy, kernel bug work-around. Verified on a synthetic scan only
   (see OSC_HANDOFF.md v1.6.0.dev1). Not yet run on real data, not yet pushed/run on OSC.
+- 2026-10-13: Phase 2 done on the laptop (v1.6.0.dev2): sigma via pyebsdindex calcsigma on
+  the shared object, homebrew sigma code deleted, preview aligned (pyebsdindex sigma +
+  saturation rule, own borders), makeautomask called directly. Synthetic-scan checks on
+  both engines: interior preview == batch within 1 grey level, 1-2 ms/click, sigma reused
+  (1 ms), direct-click path computes sigma once and matches the post-Optimize-Lambda map.
+  Still not run on real data; OSC untouched.

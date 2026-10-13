@@ -84,6 +84,10 @@ Output files this script creates (<scan>_gpuselftest_gpu.up1 / _cpu.up1, plus
 whatever _gpu_nlpar_result.up1 / _cpu_nlpar_result.up1 the app itself writes) are
 removed before exit, whether the run passes or fails.
 """
+import sys as _sys
+_sys.exit("osc_gpu_selftest.py predates v1.6: it compared the removed CuPy NLPAR/sigma code against the CPU "
+          "code. It is rewritten in Phase 4 of PLAN_NLPAR_PYEBSDINDEX.md to compare pyebsdindex OpenCL vs numba.")
+
 import argparse
 import os
 import sys

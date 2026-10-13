@@ -6,6 +6,28 @@ was done, what was verified, and what is deliberately NOT done yet.
 `OSC_SETUP.md` (from the original repo) is still the general Linux/OSC guide;
 this file is the delta on top of it.
 
+## v1.6.0.dev2 (2026-10-13): sigma and aperture through pyebsdindex, preview aligned (Phase 2)
+
+Rule from Max (2026-10-13): use pyebsdindex modules wherever they exist; homebrew only
+for features pyebsdindex lacks (Phase 3) or clearly worthwhile speedups (later). One
+explicit exception: the single-pixel NLPAR/NPAR preview stays our NumPy code because it
+must be near-instant on click and Max likes it.
+
+- `_ensure_sigma_map` now takes sigma from the shared pyebsdindex object (`calcsigma`,
+  nn=1, saturation_protect): after Optimize Lambda it is already there (1 ms); a click
+  before Optimize Lambda pays the one-time calcsigma pass. `sigma_sq_map` = sigma**2,
+  rows never recorded (truncated map) are 0. The CuPy and threaded-CPU sigma code
+  (`_compute_sigma_map_gpu/_cpu`, ~140 lines) is deleted.
+- `_compute_nlpar_single` (preview) aligned with the batch kernel: pyebsdindex sigma, and
+  the saturation rule (pixel pairs with either value >= 0.9961*max (OpenCL) / 0.999*max
+  (numba) of the data max are dropped, pixel count is per pair). Borders stay ours
+  (zero-pad). Verified on the synthetic scan: interior preview == batch within 1 grey
+  level on both engines, 1-2 ms per click; corner pixels differ (17-29 levels) because
+  the border rules differ, as documented.
+- Circular aperture calls `nlpar.NLPAR.makeautomask` instead of a local copy.
+- `osc_gpu_selftest.py` now exits with a message: it compared the removed CuPy code.
+  Rewrite is Phase 4.
+
 ## v1.6.0.dev1 (2026-10-13): NLPAR batch through pyebsdindex (Phase 1 of PLAN_NLPAR_PYEBSDINDEX.md)
 
 Decision (Max, 2026-10-13): the full-dataset NLPAR runs through pyebsdindex's own

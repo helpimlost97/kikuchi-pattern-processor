@@ -42,8 +42,12 @@ turned out to be useful enough to publish.
     σ map from Optimize λ is reused by the batch. The viewer patches one line of
     pyebsdindex's OpenCL kernel at startup (neighbour σ indexed as the centre σ;
     see `PLAN_NLPAR_PYEBSDINDEX.md`); `KPP_NLPAR_KERNEL_PATCH=0` disables that.
-  - On-demand single-pixel preview before committing to the full pass
-  - **Optimize λ** delegates to `pyebsdindex.nlpar.NLPAR.opt_lambda`
+  - On-demand single-pixel preview before committing to the full pass (our own
+    NumPy code, kept for instant response; it uses pyebsdindex's σ map and
+    saturation rule so interior pixels match the batch, and zero-pads at the
+    scan border where pyebsdindex shifts or mirrors the window)
+  - σ map and **Optimize λ** come from `pyebsdindex.nlpar.NLPAR.calcsigma` /
+    `opt_lambda` on one shared object, so σ is computed once per aperture
   - The pre-1.6 CuPy shift-and-compare batch is still in the file behind
     `KPP_NLPAR_ENGINE=legacy` for comparison and will be removed
 - **NPAR** as a uniform-weight special case (single-pixel preview only;
