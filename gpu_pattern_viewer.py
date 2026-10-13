@@ -70,22 +70,24 @@ def _patch_pyebsdindex_nlpar_kernel():
         text = open(src, encoding='utf-8').read()
         sha = hashlib.sha1(text.encode('utf-8')).hexdigest()
         full = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'patches', 'clnlpar_fixed.cl')
+        kdir = os.path.join(tempfile.gettempdir(), 'kikuchi_pattern_processor')
         if sha in _KNOWN_SHIPPED_CLNLPAR and os.path.isfile(full):
             dst, level = full, 'full'            # known 0.3.9.x file: use our complete fixed copy
         else:
-            bad, good = "sigma_ij = sigma[indx_xy];", "sigma_ij = sigma[indx_ij];"
-            if text.count(bad) != 1:
+            # Unknown upstream version: derive the full fix from the installed text with the
+            # same line-level transform that produced patches/clnlpar_fixed.cl. Every anchor
+            # must hit exactly once, otherwise only the sigma line is fixed.
+            fixed, level = _transform_clnlpar(text)
+            if fixed is None:
                 return None, None                # fixed upstream (or changed beyond recognition): leave it
-            fixed = text.replace(bad, good)
             tag = hashlib.sha1(fixed.encode()).hexdigest()[:12]
-            kdir = os.path.join(tempfile.gettempdir(), 'kikuchi_pattern_processor')
             os.makedirs(kdir, exist_ok=True)
-            dst = os.path.join(kdir, f'clnlpar_fixed_{tag}.cl')
+            dst = os.path.join(kdir, f'clnlpar_fixed_{level}_{tag}.cl')
             if not os.path.exists(dst):
                 with open(dst, 'w', encoding='utf-8') as f: f.write(fixed)
-            level = 'sigma-only'
-            print(f"[NLPAR] unknown pyebsdindex clnlpar.cl (sha1 {sha[:12]}): only the sigma-index fix is applied; "
-                  f"pattern sizes with (height*width) % 16 != 0 will run NLPAR on the CPU instead")
+            print(f"[NLPAR] pyebsdindex clnlpar.cl sha1 {sha[:12]} is not the version the shipped patch was made "
+                  f"from; derived patch level: {level}"
+                  + ("" if level == 'full' else "; pattern sizes with (height*width) % 16 != 0 will run NLPAR on the CPU instead"))
         orig = openclparam.OpenClParam.get_context
         def get_context(self, gpu_id=None, kfile='clkernels.cl'):
             if kfile == 'clnlpar.cl':
@@ -96,6 +98,55 @@ def _patch_pyebsdindex_nlpar_kernel():
     except Exception as _e:
         print(f"[NLPAR] could not patch pyebsdindex's OpenCL kernel ({_e}); using it as shipped")
         return None, None
+
+def _transform_clnlpar(text):
+    """Apply the kernel fixes to the text of an arbitrary pyebsdindex clnlpar.cl.
+    Returns (fixed_text, 'full') when every anchor of the alignment/tail fix matched exactly
+    once, (fixed_text, 'sigma-only') when only the sigma line could be fixed, (None, None)
+    when not even that line exists. Same transform that produced patches/clnlpar_fixed.cl."""
+    import re
+    bad, good = "sigma_ij = sigma[indx_xy];", "sigma_ij = sigma[indx_ij];"
+    if text.count(bad) != 1:
+        return None, None
+    s = text.replace(bad, good)
+    helpers = (
+        "\n/* Patched at runtime by the Kikuchi Pattern Processor: vload16/vstore16 instead of\n"
+        "   float16 pointer casts, element-wise partial last vector, register accumulation.\n"
+        "   See patches/clnlpar_fixed.cl in that repo for the annotated version. */\n"
+        "inline float16 loadpat16(const __global float *p, const long nvalid){\n"
+        "  if (nvalid >= 16) { return vload16(0, p); }\n"
+        "  float tmp[16];\n"
+        "  for (int q = 0; q < 16; ++q) { tmp[q] = (q < nvalid) ? p[q] : 0.0f; }\n"
+        "  return vload16(0, tmp);\n"
+        "}\n"
+        "inline void storepat16(__global float *p, const float16 v, const long nvalid){\n"
+        "  if (nvalid >= 16) { vstore16(v, 0, p); return; }\n"
+        "  float tmp[16];\n"
+        "  vstore16(v, 0, tmp);\n"
+        "  for (int q = 0; q < nvalid; ++q) { p[q] = tmp[q]; }\n"
+        "}\n\n__kernel void nlloadpat8bit(")
+    ok = (s.count('__kernel void nlloadpat8bit(') == 1
+          and s.count('*(__global float16*) (data + indx0+16*z)') == 3
+          and s.count('*(__global float16*) (data + indx_ij+16*z)') == 3
+          and s.count('*(__global float16*) (dataout + indx0+16*z) += d1;') == 1)
+    if not ok:
+        return s, 'sigma-only'
+    t = s.replace('__kernel void nlloadpat8bit(', helpers, 1)
+    t = t.replace('*(__global float16*) (data + indx0+16*z)', 'loadpat16(data + indx0+16*z, npatpoint - 16*z)')
+    t = t.replace('*(__global float16*) (data + indx_ij+16*z)', 'loadpat16(data + indx_ij+16*z, npatpoint - 16*z)')
+    t = t.replace('*(__global float16*) (dataout + indx0+16*z) += d1;', 'acc += d1;')
+    m = re.search(r'\n(\s*)mask0 = mask\[z\];\s*\n\s*mask0 =  \(mask0 > \(float16\) -1\.e-3\)', t)
+    if not m or t.count('acc += d1;') != 1:
+        return s, 'sigma-only'
+    t = t[:m.start()] + '\n' + m.group(1) + 'float16 acc = (float16) (0.0f);' + t[m.start():]
+    m2 = re.compile(r'count \+= 1;[ \t]*\n([ \t]*)\}[ \t]*\n([ \t]*)\}[ \t]*\n([ \t]*)\}').search(t, t.index('acc += d1;'))
+    if not m2:
+        return s, 'sigma-only'
+    pos = m2.start(3)
+    t = t[:pos] + m2.group(2) + 'storepat16(dataout + indx0+16*z, acc, npatpoint - 16*z);\n' + t[pos:]
+    if '*(__global float16*)' in t:
+        return s, 'sigma-only'
+    return t, 'full'
 
 # sha1 of pyebsdindex/opencl/clnlpar.cl as shipped in releases our full patch was made from.
 _KNOWN_SHIPPED_CLNLPAR = {
