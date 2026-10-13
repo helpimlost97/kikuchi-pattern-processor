@@ -91,6 +91,7 @@ gpu_pattern_viewer.bat    Windows launcher (calls `python` from PATH — edit
                           if your interpreter is named differently)
 run_gui.sh                Linux / HPC launcher (modules + venv from local/env.sh)
 Kikuchi Pattern Processor.desktop   Desktop launcher for Linux desktops (edit the path)
+GETTING_STARTED.md        Step-by-step setup with PyCharm on Windows, first session, switches
 LINUX_HPC_SETUP.md        Running on Linux or a Slurm cluster
 selftest.py               Headless load / sigma / NLPAR / Apply && Save check with timings
 patches/clnlpar_fixed.cl  Corrected copy of pyebsdindex's OpenCL NLPAR kernel (see below)
@@ -124,6 +125,9 @@ local/                    Git-ignored: your site-specific launch settings and no
     pick the variant matching your CUDA toolkit)
 
 ### Install
+
+New to this? `GETTING_STARTED.md` walks through a PyCharm setup on Windows step by
+step, including the first session and the environment switches.
 
 ```bash
 pip install pyqt5 pyebsdindex numpy scipy scikit-image matplotlib psutil
