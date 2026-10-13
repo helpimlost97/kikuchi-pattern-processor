@@ -1,15 +1,15 @@
-"""Headless self-test / benchmark for gpu_pattern_viewer.py on OSC (no display needed).
+"""Headless self-test / benchmark for gpu_pattern_viewer.py (no display needed).
 
-    python osc_selftest.py <scan.up1> [--orig gpv_orig.py] [--no-nlpar]
+    python selftest.py <scan.up1> [--orig gpv_orig.py] [--no-nlpar]
 
 Runs, with timings:  load -> sigma-squared map (CPU) -> NLPAR batch (pyebsdindex,
-numba) -> Apply && Save (static bg subtract + dynamic bg + per-pattern normalize +
+OpenCL or numba) -> Apply && Save (static bg subtract + dynamic bg + per-pattern normalize +
 CLAHE) on the ORIGINAL patterns, writing <scan>_selftest_out.up1 next to the input.
 
 With --orig <file>, the same load -> sigma -> Apply&&Save sequence is also run
-through that copy of the program (e.g. the pre-OSC version from git) and the sigma
+through that copy of the program (e.g. an older version from git) and the sigma
 maps and output files are compared, to prove the threaded CPU paths give the same
-answer. Thread count comes from the SLURM cpuset, or KPP_THREADS=<n>.
+answer. Thread count comes from the Slurm cpuset (or os.cpu_count), or KPP_THREADS=<n>.
 """
 import os, sys, time, importlib.util, hashlib
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')

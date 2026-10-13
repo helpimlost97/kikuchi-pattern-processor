@@ -1,12 +1,12 @@
-__version__ = "1.6.0.dev5"   # shown in the window title; bump with each release (git tag v<version>)
+__version__ = "1.6.0.dev6"   # shown in the window title; bump with each release (git tag v<version>)
 import sys
 import os
 import glob
 
 # ---------------------------------------------------------------------------
-# OSC / Linux CPU-node support [MVM+Claude 2026-09-25]
+# Linux / HPC CPU-node support (2026-09-25)
 # On a SLURM node the process only owns the cores/RAM it asked for, not the
-# whole machine (Cardinal: 104 cores, ~500 GB). os.sched_getaffinity sees the
+# whole machine (e.g. a 104-core, 500 GB node). os.sched_getaffinity sees the
 # cpuset SLURM pinned us to; the cgroup memory limit is what the OOM killer
 # enforces, while psutil reports node-wide numbers. Everything CPU-parallel
 # below sizes itself from these two helpers.
@@ -42,7 +42,7 @@ if os.environ.get('KPP_GPU', '').strip() == '0':
 else:
     from pyebsdindex import nlpar
 # Which engine pyebsdindex resolved to. The NLPAR batch and Optimize Lambda both run
-# through it (Phase 1); the CuPy batch is only reachable with KPP_NLPAR_ENGINE=legacy.
+# through it (Phase 1).
 NLPAR_ON_GPU = nlpar.NLPAR.__module__.startswith('pyebsdindex.opencl')
 NLPAR_ENGINE = "pyebsdindex OpenCL" if NLPAR_ON_GPU else "pyebsdindex CPU (numba)"
 
@@ -274,7 +274,7 @@ def read_patterns_parallel(path, offset, n_pat, ph, pw, dtype, out=None, nthr=No
     (n_pat, ph, pw) array, several threads each streaming one contiguous byte range.
 
     Why not pyebsdindex's slab reader: it zero-fills the block, then reads and copies
-    it row by row through np.fromfile in ONE stream. Measured on Cardinal (Ni RKD scan
+    it row by row through np.fromfile in ONE stream. Measured on a 104-core HPC node (Ni RKD scan
     in home, 2026-09-27): a single stream tops out at 130-220 MB/s on home NFS while
     8 streams reach ~830 MB/s; the row-by-row copy alone costs ~20 s per 32 GB even
     from the page cache. This reads straight into the destination buffer, no copies.
@@ -568,7 +568,7 @@ class MainWindow(QMainWindow):
 
     def _remove_temp_files(self):
         """Delete the NLPAR batch result files this session created (next to their
-        inputs). Called on app exit and when a new dataset is loaded (Max, 2026-09-27),
+        inputs). Called on app exit and when a new dataset is loaded (2026-09-27),
         so a 5-32 GB _cpu_nlpar_result.up1 doesn't sit around until the app closes."""
         for f in self._temp_files:
             try:
@@ -658,7 +658,7 @@ class MainWindow(QMainWindow):
         the smaller of 3 GB and a quarter of the currently AVAILABLE RAM, so a busy machine
         chunks smaller instead of swapping (or dying with _ArrayMemoryError)."""
         if budget is None:
-            # Was min(3 GB, 25% of available). On a 500 GB OSC node that meant 1-row chunks
+            # Was min(3 GB, 25% of available). On a 500 GB HPC node that meant 1-row chunks
             # (a 430-col 479x479 row is ~1.8 GB at 18 B/px), starving the threaded paths.
             # Scale the cap with the thread count, but never exceed a quarter of what the
             # SLURM cgroup actually lets us allocate.
@@ -667,19 +667,6 @@ class MainWindow(QMainWindow):
         bytes_per_row = self.ncols * ph * pw * float(bytes_per_pixel_live)
         n_total = n_rows_total if n_rows_total is not None else self.nrows
         return max(1, min(int(n_total), int(budget // max(bytes_per_row, 1))))
-
-    def _host_padded_chunk_rows(self, bytes_per_pixel_live, sr):
-        """Like _host_chunk_rows, for the GPU shift-and-compare passes whose host-side
-        block is PADDED: a chunk of r scan rows is staged as (r + 2*sr) x (ncols + 2*sr)
-        patterns, so `bytes_per_pixel_live` is charged on that padded grid, not on
-        r x ncols. Same budget as _host_chunk_rows. Returns at least 1 even if one row
-        plus its border does not fit (nothing smaller exists)."""
-        ncols, sr = int(self.ncols), int(sr)
-        # Budget expressed in ncols-wide rows (uncapped by the scan height), then
-        # converted to padded rows and the 2*sr border rows taken off.
-        grid_rows = self._host_chunk_rows(bytes_per_pixel_live, n_rows_total=1 << 40)
-        r = (grid_rows * ncols) // (ncols + 2 * sr) - 2 * sr
-        return max(1, min(int(self.nrows), r))
 
     def _invalidate_global_range(self):
         """Discard cached global-stretch bounds. Call on file load or when the
@@ -882,7 +869,7 @@ class MainWindow(QMainWindow):
         (opt_lambda typically returns ~0.6–1.2). λ → ∞ recovers NPAR; λ → 0 recovers
         the identity (no smoothing).
 
-        Kept as our own NumPy code by decision (Max, 2026-10-13; PLAN_NLPAR_PYEBSDINDEX.md):
+        Kept as our own NumPy code by design decision (2026-10-13; PLAN_NLPAR_PYEBSDINDEX.md):
         it is the fast interactive preview. Two things are aligned with pyebsdindex's batch
         kernel so interior pixels come out the same (Phase 2):
           * σ² comes from pyebsdindex's calcsigma (see _ensure_sigma_map);
@@ -1236,7 +1223,7 @@ class MainWindow(QMainWindow):
 
     def _nlpar_result_to_ram(self, nlobj):
         """Point a pyebsdindex NLPAR object's OUTPUT at a second in-RAM array
-        (self.nlpar_patterns) instead of _cpu_nlpar_result.up1 (Max, 2026-09-28: only
+        (self.nlpar_patterns) instead of _cpu_nlpar_result.up1 (2026-09-28: only
         Apply && Save should write to disk). Allocation rules: _alloc_nlpar_ram. Returns
         False (caller writes the temp file as before) when it does not fit."""
         if not self._alloc_nlpar_ram():
@@ -1746,7 +1733,7 @@ class MainWindow(QMainWindow):
         mean_accum = np.zeros((ph, pw), dtype=np.float64)
         sumsq_accum = np.zeros((ph, pw), dtype=np.float64)  # for per-pixel std (variance-based aperture detection)
         total_pats = 0
-        # Threaded statistics (OSC): each chunk is read once in this thread, then split
+        # Threaded statistics (HPC CPU nodes): each chunk is read once in this thread, then split
         # into ~nthr slices of patterns that the pool reduces independently. The merge
         # is exact: the per-pattern std is independent of the split, and both running
         # sums are float64 over integer-valued terms, so the result is bit-identical to
@@ -1937,8 +1924,7 @@ class MainWindow(QMainWindow):
 
     def apply_nlpar_batch(self):
         """Run NLPAR on the full dataset through pyebsdindex (OpenCL or numba, chosen at
-        import). The old CuPy shift-and-compare batch stays reachable only with
-        KPP_NLPAR_ENGINE=legacy for the Phase 4 comparison (PLAN_NLPAR_PYEBSDINDEX.md)."""
+        import). See PLAN_NLPAR_PYEBSDINDEX.md."""
         if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1/UP2 file first"); return
         if not self._lambda_optimized:
             QMessageBox.information(self, "Optimize lambda first",
@@ -1950,251 +1936,7 @@ class MainWindow(QMainWindow):
         if self._nlpar_busy:
             QMessageBox.information(self, "NLPAR is running", "Wait for the running NLPAR step to finish."); return
 
-        if os.environ.get('KPP_NLPAR_ENGINE', '').strip().lower() == 'legacy':
-            if not HAS_GPU:
-                QMessageBox.warning(self, "Legacy NLPAR engine",
-                                    "KPP_NLPAR_ENGINE=legacy selects the CuPy batch, which needs a CUDA device.")
-                return
-            # Guard so an OOM/driver error becomes a dialog instead of killing the app.
-            try:
-                self._apply_nlpar_gpu(sr, lam)
-            except Exception as e:
-                import traceback; traceback.print_exc()
-                self.statusBar().showMessage("NLPAR (legacy CuPy) failed")
-                QMessageBox.critical(self, "NLPAR (legacy CuPy) failed", str(e))
-            return
         self._apply_nlpar_pyebsdindex(sr, lam)
-
-    def _apply_nlpar_gpu(self, sr, lam):
-        """GPU-accelerated NLPAR using the canonical Brewick/Wright/Rowenhorst 2019
-        formulation. See _compute_nlpar_single docstring for the equations."""
-        # Ensure σ² map is available for the current aperture.
-        self._ensure_sigma_map()
-        if self._nlpar_params()['saturation_protect']:
-            # The weight is a z-score with sqrt(2N) in the denominator (N ~ 2e5 pixels), so
-            # sigma must be estimated on exactly the pixel set the distance uses. Since
-            # Phase 2 the sigma map is pyebsdindex's, which drops saturated pixel pairs;
-            # this kernel does not, and on a scan with saturated pixels every neighbour
-            # weight collapses to ~0 (FG10 RKD: output == input). Measured 2026-10-13.
-            print("[GPU NLPAR] WARNING: legacy CuPy batch with 'Saturation protect' ON is not self-consistent "
-                  "(sigma excludes saturated pixel pairs, this kernel does not); results are only comparable "
-                  "to pyebsdindex with saturation protect OFF.")
-        self.statusBar().showMessage(f"Running NLPAR GPU (SR={sr}, lam={lam:.2f})..."); QApplication.processEvents()
-        t0 = time.time()
-        ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
-        lam_sq = np.float32(lam * lam)
-        # Aperture mask (pyebsdindex-compatible) - applied to SSD if mode != "None".
-        # Modes: None / Circular (EBSD) / Auto-detect (variance-based, for RKD or other geometries).
-        aperture_2d, aperture_count, ap_label = self._resolve_aperture_mask(ph, pw)
-        N_p = float(aperture_count)
-        sqrt_2Np = np.float32(np.sqrt(2.0 * N_p))
-        N_p_f32 = np.float32(N_p)
-        if aperture_2d is not None:
-            g_aperture = cp.asarray(aperture_2d)
-            print(f"[GPU NLPAR] Canonical Brewick et al. 2019 formula. Aperture {ap_label}: "
-                  f"N_p = {int(N_p)}/{ph*pw} pixels active ({100*N_p/(ph*pw):.1f}%)")
-        else:
-            g_aperture = None
-            print(f"[GPU NLPAR] Canonical Brewick et al. 2019 formula. Aperture {ap_label}: "
-                  f"using all N_p = {int(N_p)} pixels")
-        # Pre-load σ² map onto GPU (small: nrows*ncols*4 bytes)
-        g_sigma_full = cp.asarray(self.sigma_sq_map.astype(np.float32))
-        mask = self._get_iq_mask()  # (nrows, ncols) bool
-        n_avail = getattr(self, 'n_actual_rows', self.nrows)
-
-        # Output: the in-RAM result array when a second copy of the scan fits (same rule
-        # and partial-row handling as the CPU batch, see _alloc_nlpar_ram), else the
-        # temp file as before.
-        to_ram = self._alloc_nlpar_ram(tag="[GPU NLPAR]")
-        # Rows NLPAR produces: only the full rows that were recorded, like the CPU path
-        # (nlobj.nrows = n_actual_rows). The partial last row is copied from the original
-        # (RAM: by _alloc_nlpar_ram; file: it is beyond what we write, and the reader
-        # returns zeros there). Looping to the header's nrows used to crash on a map
-        # stopped early once a chunk started past the recorded rows (read_r1 < read_r0
-        # gave a negative slice; reviewer fix 2026-09-28).
-        n_rows_loop = int(n_avail)
-        out_path = None
-        if not to_ram:
-            # Output file setup
-            tmp_dir = os.path.dirname(self.orig_path)
-            out_path = os.path.join(tmp_dir, "_gpu_nlpar_result" + self.src_ext)   # .up1/.up2 = dtype
-            # Create the file ourselves: source header verbatim + sparse truncate to the
-            # number of patterns the source actually has. Letting pyebsdindex create it
-            # pre-fills every pattern with zeros one tofile() at a time (see apply_and_save).
-            hdr_len = int(self.f_orig.filePos)
-            with open(self.orig_path, 'rb') as f_src:
-                hdr = f_src.read(hdr_len)
-            with open(out_path, 'wb') as f_dst:
-                f_dst.write(hdr)
-                f_dst.truncate(hdr_len + int(getattr(self, 'n_actual_pats', self.nrows * self.ncols)) * ph * pw
-                               * int(np.dtype(self.f_orig.filedatatype).itemsize))
-            out_obj = ebsd_pattern.get_pattern_file_obj(out_path)
-
-        # Adaptive chunk size based on VRAM and pattern dimensions
-        pat_bytes = ph * pw * 4  # float32
-        # Memory per chunk_row: ~5x (padded + weighted_sum + temporaries) × (ncols + 2*sr) × pat_bytes
-        mem_per_row = 5 * (self.ncols + 2 * sr) * pat_bytes
-        vram_budget = int(cp.cuda.Device(0).mem_info[1] * 0.6)  # use 60% of total VRAM
-        CHUNK_ROWS = max(2, vram_budget // mem_per_row)
-        CHUNK_ROWS = min(CHUNK_ROWS, self.nrows)
-        # Host-side caps (fitting VRAM is not fitting RAM: a 94 GB H100 on a 2131-col scan
-        # picks chunks whose host-side float32 `padded` block alone is tens of GB).
-        # Two phases, never live together:
-        #  * staging: float32 read (4 B/px; a file read's native buffer is gone by then)
-        #    + float32 `padded` (4 B/px) = 8 B/px on the PADDED (rows+2sr) x (ncols+2sr)
-        #    grid. pad_mask/pad_sigma are per pattern, negligible. Freed after upload.
-        #  * result: float32 result_np (4) + pat_flt2int's float32 clip() copy (4) + its
-        #    uint8/16 astype (1-2) + its zeros output (1-2) = 10-12 B/px on rows x ncols
-        #    (same in file mode: write_data runs the same pat_flt2int). cp.asnumpy's
-        #    transient before .astype is 4+4 = 8, below that.
-        # The in-RAM result array itself was sized by _alloc_nlpar_ram (<= 60% of available)
-        # and is not committed yet (np.empty), so the 25%-of-available chunk budget below
-        # still leaves headroom as the chunks fill it, as in the CPU path.
-        CHUNK_ROWS = min(CHUNK_ROWS, self._host_padded_chunk_rows(8, sr),
-                         self._host_chunk_rows(12))
-        print(f"[GPU NLPAR] Pattern: {ph}x{pw}, VRAM budget: {vram_budget/1e9:.1f} GB, CHUNK_ROWS: {CHUNK_ROWS}"
-              f", rows={n_rows_loop}/{self.nrows} -> {'RAM' if to_ram else out_path}")
-
-        for chunk_start in range(0, n_rows_loop, CHUNK_ROWS):
-            chunk_rows = min(CHUNK_ROWS, n_rows_loop - chunk_start)
-
-            # Read range with border (clamped to available data)
-            read_r0 = max(0, chunk_start - sr)
-            read_r1 = min(n_avail, chunk_start + chunk_rows + sr)
-            # Cap for mask indexing: rows that were never recorded are not neighbours
-            # (as in the CPU path).
-            mask_r1 = min(n_rows_loop, chunk_start + chunk_rows + sr)
-
-            if read_r1 > read_r0:
-                data_np = self._read_rows(self.f_orig, read_r0, read_r1 - read_r0, as_float=True)
-                # copy=False: read_data already returned float32, don't duplicate the block.
-                data_np = data_np.reshape(read_r1 - read_r0, self.ncols, ph, pw).astype(np.float32, copy=False)
-            else:
-                data_np = np.zeros((0, self.ncols, ph, pw), dtype=np.float32)
-
-            # Build full padded block: (chunk_rows + 2*sr, ncols + 2*sr, ph, pw)
-            full_h = chunk_rows + 2 * sr
-            full_w = self.ncols + 2 * sr
-            padded = np.zeros((full_h, full_w, ph, pw), dtype=np.float32)
-            pad_mask = np.zeros((full_h, full_w), dtype=bool)
-            # Padded σ² for the chunk: same shape as pad_mask. Pad with 0 (handled below).
-            pad_sigma = np.zeros((full_h, full_w), dtype=np.float32)
-
-            # Where does real data sit inside padded array?
-            dst_r0 = sr - (chunk_start - read_r0)  # offset in padded for first read row
-            dst_r1 = dst_r0 + (read_r1 - read_r0)
-            padded[dst_r0:dst_r1, sr:sr+self.ncols, :, :] = data_np
-
-            # Mask: get corresponding rows, pad with False
-            mask_slice_r0 = read_r0
-            mask_slice_r1 = min(mask_r1, self.nrows)
-            real_mask = mask[mask_slice_r0:mask_slice_r1, :]
-            pad_mask[dst_r0:dst_r0+real_mask.shape[0], sr:sr+self.ncols] = real_mask
-            # σ² for the same rows
-            real_sigma = self.sigma_sq_map[mask_slice_r0:mask_slice_r1, :]
-            pad_sigma[dst_r0:dst_r0+real_sigma.shape[0], sr:sr+self.ncols] = real_sigma.astype(np.float32)
-
-            del data_np
-
-            # Upload to GPU
-            g_padded = cp.asarray(padded)
-            g_mask = cp.asarray(pad_mask)
-            g_sigma = cp.asarray(pad_sigma)
-            del padded, pad_mask, pad_sigma
-
-            # Center patterns: rows [sr : sr+chunk_rows], cols [sr : sr+ncols]
-            center = g_padded[sr:sr+chunk_rows, sr:sr+self.ncols, :, :]  # view
-            center_sigma = g_sigma[sr:sr+chunk_rows, sr:sr+self.ncols]
-            weighted_sum = cp.zeros((chunk_rows, self.ncols, ph, pw), dtype=cp.float32)
-            weight_total = cp.zeros((chunk_rows, self.ncols), dtype=cp.float32)
-
-            # Shift-and-compare over neighborhood. Canonical NLPAR formula:
-            #   d_raw   = Σ_k (p_i[k] - p_j[k])²  over aperture pixels
-            #   d̃     = (d_raw − N_p (σ²_i + σ²_j)) / (sqrt(2 N_p) (σ²_i + σ²_j))
-            #   w(i,j) = exp(-max(d̃, 0) / λ²)
-            for dr in range(-sr, sr + 1):
-                for dc in range(-sr, sr + 1):
-                    nb = g_padded[sr+dr:sr+dr+chunk_rows, sr+dc:sr+dc+self.ncols, :, :]
-                    nb_mask = g_mask[sr+dr:sr+dr+chunk_rows, sr+dc:sr+dc+self.ncols]
-                    nb_sigma = g_sigma[sr+dr:sr+dr+chunk_rows, sr+dc:sr+dc+self.ncols]
-
-                    diff = center - nb
-                    if g_aperture is not None:
-                        # Sum of squared differences over aperture pixels (NOT mean — Eq. 3 is a sum).
-                        d_raw = (diff * diff * g_aperture).reshape(chunk_rows, self.ncols, -1).sum(axis=2)
-                    else:
-                        d_raw = (diff * diff).reshape(chunk_rows, self.ncols, -1).sum(axis=2)
-                    sigma_combined = center_sigma + nb_sigma  # (chunk_rows, ncols)
-                    # Guard against σ²_combined ≈ 0 (should be rare after median-fill in σ map)
-                    safe_sc = cp.where(sigma_combined > cp.float32(1e-10),
-                                       sigma_combined,
-                                       cp.float32(1.0))
-                    d_norm = (d_raw - N_p_f32 * sigma_combined) / (sqrt_2Np * safe_sc)
-                    d_clipped = cp.maximum(d_norm, cp.float32(0.0))
-                    w = cp.exp(-d_clipped / lam_sq) * nb_mask.astype(cp.float32)
-                    # Zero out the (almost certainly impossible) degenerate σ²=0 case
-                    # except for the self-pair, where center contributes with weight 1.
-                    if dr != 0 or dc != 0:
-                        w = cp.where(sigma_combined > cp.float32(1e-10), w, cp.float32(0.0))
-
-                    weighted_sum += w[:, :, None, None] * nb
-                    weight_total += w
-                    del diff, d_raw, sigma_combined, safe_sc, d_norm, d_clipped, w, nb, nb_mask, nb_sigma
-
-            # Normalize
-            safe_wt = cp.where(weight_total > 0, weight_total, cp.ones_like(weight_total))
-            result = weighted_sum / safe_wt[:, :, None, None]
-            # Where weight is 0, keep center pattern
-            zero_wt = (weight_total == 0)
-            result[zero_wt] = center[zero_wt]
-
-            result_np = cp.asnumpy(result).reshape(chunk_rows * self.ncols, ph, pw).astype(np.float32)
-            del g_padded, g_mask, g_sigma, weighted_sum, weight_total, result, center, center_sigma
-            cp.get_default_memory_pool().free_all_blocks()
-
-            # Zero out masked patterns in output
-            mask_chunk = mask[chunk_start:chunk_start+chunk_rows, :].flatten()
-            result_np[~mask_chunk] = 0.0
-
-            # Write to output
-            if to_ram:
-                # Exactly what out_obj.write_data(result_np, [p0, -1]) would have put in
-                # the file: its 1-D branch calls pat_flt2int(pats, typeout=<file dtype>,
-                # method='clip', scalevalue=0.98, maxScale=None) on the whole block.
-                p0 = chunk_start * int(self.ncols)
-                pat2write = ebsd_pattern.pat_flt2int(result_np, typeout=self.f_orig.filedatatype,
-                                                     method='clip', scalevalue=0.98, maxScale=None)
-                self.nlpar_patterns[p0:p0 + pat2write.shape[0]] = pat2write
-                del pat2write
-            else:
-                out_obj.write_data(newpatterns=result_np, patStartCount=[chunk_start * self.ncols, -1], writeHead=False)
-            del result_np
-
-            elapsed_so_far = time.time() - t0
-            rows_done = chunk_start + chunk_rows
-            eta = (elapsed_so_far / rows_done) * (n_rows_loop - rows_done) if rows_done > 0 else 0
-            self.statusBar().showMessage(
-                f"NLPAR GPU: row {rows_done}/{n_rows_loop} ({elapsed_so_far:.0f}s, ETA {eta:.0f}s)")
-            QApplication.processEvents()
-
-        elapsed = time.time() - t0
-        # Free the full-dataset σ² we kept on GPU.
-        del g_sigma_full
-        cp.get_default_memory_pool().free_all_blocks()
-        if to_ram:
-            self.f_nlpar = RamUPFile(self.orig_path, self.nlpar_patterns)
-            self.nlpar_chk.setChecked(False)
-            self.nlpar_status.setText(f"NLPAR in RAM (GPU): SR={sr}, lam={lam:.2f} ({elapsed:.1f}s)")
-            self.statusBar().showMessage(f"NLPAR GPU complete in RAM ({elapsed:.1f}s)")
-            print(f"[GPU NLPAR] done in {elapsed:.1f}s -> RAM")
-            self.update_display()
-            return
-        self._temp_files.append(out_path)
-        self.f_nlpar = ebsd_pattern.get_pattern_file_obj(out_path)
-        self.nlpar_chk.setChecked(False)
-        self.nlpar_status.setText(f"GPU NLPAR: SR={sr}, lam={lam:.2f} ({elapsed:.1f}s)")
-        self.statusBar().showMessage(f"NLPAR GPU complete ({elapsed:.1f}s)")
-        self.update_display()
 
     def _apply_nlpar_pyebsdindex(self, sr, lam):
         """Full-dataset NLPAR through pyebsdindex, straight off self.orig_path (or the
@@ -2204,7 +1946,7 @@ class MainWindow(QMainWindow):
         by Optimize Lambda is reused here instead of a second full pass; lambda and SR
         are taken from the spin boxes (a hand-edited lambda wins over nlobj.lam).
 
-        Two contract points that the pre-OSC implementation got wrong because it fed
+        Two contract points that the pre-1.0 implementation got wrong because it fed
         NLPAR a pre-masked duplicate of the scan:
 
         * Dead pixels KEEP their values in the output. They are excluded from the d2
@@ -2360,7 +2102,7 @@ class MainWindow(QMainWindow):
         # Let the file dialog finish tearing down before the main thread goes busy.
         # Otherwise its deferred X11 events are handled mid-save and the xcb backend logs
         # "XCB error: 3 (BadWindow) ... TranslateCoords" for the already-destroyed dialog
-        # window. Harmless, but it reads like a failure (Max, 2026-10-10).
+        # window. Harmless, but it reads like a failure (2026-10-10).
         for _ in range(3): QApplication.processEvents()
         self.statusBar().showMessage(f"Processing all patterns ({'GPU' if HAS_GPU else 'CPU'})..."); QApplication.processEvents()
         t0 = time.time()

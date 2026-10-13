@@ -1,4 +1,4 @@
-# Draft upstream report for PyEBSDIndex (not posted; Max decides)
+# Draft upstream report for PyEBSDIndex (not posted yet)
 
 Target: https://github.com/USNavalResearchLaboratory/PyEBSDIndex/issues
 Affects: `pyebsdindex/opencl/clnlpar.cl`, kernel `calcnlpar`, in 0.3.9.x and `main`

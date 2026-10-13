@@ -30,3 +30,6 @@ _cpu_nlpar_result.up1
 
 # Logs
 *.log
+
+# machine/account-specific files (launch env, HPC handoff notes, personal launchers)
+local/

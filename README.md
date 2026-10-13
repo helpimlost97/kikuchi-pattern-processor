@@ -55,8 +55,9 @@ turned out to be useful enough to publish.
     with their defaults (on, 0) and apply to σ, λ, batch and preview alike
   - Scan borders follow pyebsdindex: the CPU kernel shifts the window inward at
     edges, the OpenCL kernel mirrors indices; the preview zero-pads
-  - The pre-1.6 CuPy shift-and-compare batch is still in the file behind
-    `KPP_NLPAR_ENGINE=legacy` for comparison and will be removed
+  - Engine choice: pyebsdindex uses OpenCL when `pyopencl` sees a GPU, else
+    numba on all cores; `KPP_GPU=0` forces the CPU engine (on 479x479 patterns a
+    24-core CPU was faster than an 8 GB laptop GPU)
 - **NPAR** as a uniform-weight special case (single-pixel preview only;
   use NLPAR with high λ for the equivalent batch behavior)
 - **Aperture masking** for the σ² estimate and the NLPAR distance term — three
@@ -83,13 +84,21 @@ turned out to be useful enough to publish.
 ## Files
 
 ```
-gpu_pattern_viewer.py     Main application (~1200 lines, single-file PyQt5 GUI)
+gpu_pattern_viewer.py     Main application (single-file PyQt5 GUI)
 gpu_pattern_viewer.bat    Windows launcher (calls `python` from PATH — edit
                           if your interpreter is named differently)
+run_gui.sh                Linux / HPC launcher (modules + venv from local/env.sh)
+Kikuchi Pattern Processor.desktop   Desktop launcher for Linux desktops (edit the path)
+LINUX_HPC_SETUP.md        Running on Linux or a Slurm cluster
+selftest.py               Headless load / sigma / NLPAR / Apply && Save check with timings
+patches/clnlpar_fixed.cl  Corrected copy of pyebsdindex's OpenCL NLPAR kernel (see below)
+PLAN_NLPAR_PYEBSDINDEX.md Design notes for the pyebsdindex-based NLPAR path
+UPSTREAM_pyebsdindex_opencl_sigma_bug.md   Draft bug report for pyebsdindex
 compare_patterns.py       Static side-by-side plot of one original vs NLPAR pattern
 interactive_compare.py    Clickable IQ map → side-by-side original / NLPAR
 run_nlpar.py              Headless NLPAR runner (opt_lambda + calcnlpar)
 _check_nlpar.py           Prints pyebsdindex UPFile source for introspection
+local/                    Git-ignored: your site-specific launch settings and notes
 ```
 
 ---
