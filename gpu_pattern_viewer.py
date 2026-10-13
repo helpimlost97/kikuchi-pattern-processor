@@ -33,7 +33,14 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, pyqtSignal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from pyebsdindex import ebsd_pattern, nlpar
+from pyebsdindex import ebsd_pattern
+# pyebsdindex picks its NLPAR class at import: the OpenCL (pyopencl) version when a GPU is
+# visible, else the numba CPU version. KPP_GPU=0 must force CPU here too: it only hides
+# CUDA from CuPy (below), OpenCL would still find the device. PLAN_NLPAR_PYEBSDINDEX.md, Phase 0.
+if os.environ.get('KPP_GPU', '').strip() == '0':
+    from pyebsdindex import nlpar_cpu as nlpar
+else:
+    from pyebsdindex import nlpar
 from scipy.ndimage import gaussian_filter
 from skimage.exposure import equalize_adapthist
 import time

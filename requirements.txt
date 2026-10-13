@@ -9,3 +9,7 @@ psutil>=5.9
 
 # GPU (optional) - install separately, pick the variant matching `module load cuda`:
 #   pip install cupy-cuda12x
+# NLPAR on GPU (optional): pyebsdindex uses its OpenCL kernels whenever pyopencl can see a
+# GPU device (NVIDIA driver / `module load cuda` provides the OpenCL runtime). Without it
+# pyebsdindex runs NLPAR on the CPU with numba.
+#   pip install pyopencl
