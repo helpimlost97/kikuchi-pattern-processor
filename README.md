@@ -69,8 +69,8 @@ turned out to be useful enough to publish.
     circle, for conventional phosphor-camera EBSD
   - `Auto-detect` — variance-based mask from the per-pixel std across the
     dataset, intended for direct electron detectors with non-circular active
-    area (e.g. Thermo Fisher TruePix RKD, where chip gaps and dead corners
-    need excluding)
+    area (e.g. annular RKD and other direct electron detectors, where chip gaps
+    and dead corners need excluding)
 - **Processing pipeline** applied to preview and full-dataset save: static
   background (subtract or divide) → dynamic background (Gaussian high-pass) →
   per-pattern min-max normalize → brightness / contrast → CLAHE → clip. The
