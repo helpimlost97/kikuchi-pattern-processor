@@ -1,6 +1,7 @@
 __version__ = "1.6.1.dev1"   # shown in the window title; bump with each release (git tag v<version>)
 import sys
 import os
+import gc
 import glob
 
 # ---------------------------------------------------------------------------
@@ -1830,6 +1831,30 @@ class MainWindow(QMainWindow):
         self.iq_mask = np.ones((self.nrows, self.ncols), dtype=bool)
         self.iq_min_slider.setValue(0); self.iq_max_slider.setValue(1000); self._update_iq_range()
         self.on_pattern_clicked(0, 0); self.statusBar().showMessage("Ready")
+
+    def unload(self):
+        """Drop the loaded data set and everything derived from it, and clear the plots (2026-10-19).
+        The workbench calls this before loading a file into its indexing tab, so that only one data
+        set is in memory at a time. Returns False (and does nothing) while a pyebsdindex call runs.
+        Harmless when nothing is loaded."""
+        if self._nlpar_busy:
+            return False
+        self.f_nlpar = None; self.nlpar_patterns = None; self.nlpar_status.setText("No NLPAR file loaded")
+        self._remove_temp_files()
+        self.orig_path = None; self.f_orig = None; self.patterns = None
+        self.nrows = self.ncols = self.current_row = self.current_col = 0
+        self.iq_map = None; self.iq_mask = None; self.mean_pattern = None; self.pixel_std = None; self.data_max = None
+        self._invalidate_sigma_map(); self._invalidate_global_range(); self._lambda_optimized = False
+        self._nlobj = None; self._nlobj_key = None; self._nl_infile = None
+        self._aperture_cache = None; self._aperture_cache_key = None
+        self.file_label.setText("No file loaded"); self.bg_status.setText("Background: all patterns")
+        for canvas in (self.scan_canvas, self.raw_canvas, self.proc_canvas):
+            canvas.ax.clear(); canvas.ax.axis('off'); canvas.draw_idle()
+        self.scan_canvas.marker = None; self.scan_canvas._mask = None; self.scan_canvas._img_handle = None
+        self.scan_canvas._mask_handle = None; self.scan_canvas.nrows = self.scan_canvas.ncols = 0
+        gc.collect()
+        self.statusBar().showMessage("Data set unloaded")
+        return True
 
     def load_nlpar_file(self):
         if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1/UP2 file first"); return

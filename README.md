@@ -80,6 +80,8 @@ turned out to be useful enough to publish.
   pyebsdindex's `backsub` does, so patterns keep their own brightness instead of
   collapsing to black at the clip (v1.6.1).
 - The control column on the left sits in a splitter: drag the divider to resize it.
+- `MainWindow.unload()` drops the loaded data set and everything derived from it (used by
+  the spherical indexing workbench so that only one data set is in memory at a time).
 - **OIM-compatible UP1/UP2 output**: pyebsdindex's `write_data` only emits the
   42-byte standard header, but v4 UP1 files have additional bytes between byte
   42 and `filePos`. This tool copies those bytes verbatim from the source file
