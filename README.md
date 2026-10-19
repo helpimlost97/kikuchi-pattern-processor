@@ -75,7 +75,11 @@ turned out to be useful enough to publish.
   background (subtract or divide) → dynamic background (Gaussian high-pass) →
   per-pattern min-max normalize → brightness / contrast → CLAHE → clip. The
   full-dataset version (`Apply && Save`) batches the chain on GPU with chunked
-  CuPy ops.
+  CuPy ops. With the per-pattern stretch off (absolute intensity preserved), the
+  static background is applied mean-free (subtract) or mean-one (divide), as
+  pyebsdindex's `backsub` does, so patterns keep their own brightness instead of
+  collapsing to black at the clip (v1.6.1).
+- The control column on the left sits in a splitter: drag the divider to resize it.
 - **OIM-compatible UP1/UP2 output**: pyebsdindex's `write_data` only emits the
   42-byte standard header, but v4 UP1 files have additional bytes between byte
   42 and `filePos`. This tool copies those bytes verbatim from the source file

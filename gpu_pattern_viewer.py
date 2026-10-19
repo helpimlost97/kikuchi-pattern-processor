@@ -1,4 +1,4 @@
-__version__ = "1.6.0.dev6"   # shown in the window title; bump with each release (git tag v<version>)
+__version__ = "1.6.1.dev1"   # shown in the window title; bump with each release (git tag v<version>)
 import sys
 import os
 import glob
@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QGroupBox, QFormLayout, QPushButton, QLabel, QSlider, QSpinBox,
     QDoubleSpinBox, QCheckBox, QComboBox, QFileDialog, QMessageBox,
-    QStatusBar, QSplitter, QSizePolicy, QScrollArea
+    QStatusBar, QSplitter, QSizePolicy, QScrollArea, QLayout
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -508,6 +508,12 @@ class RamOutUPFile(RamUPFile):
     def write_datamaxmin(self): pass
 
 
+class _ControlPanel(QWidget):
+    """The control column: never asks for more width than the splitter gives it."""
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint(); hint.setWidth(200); return hint
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -685,6 +691,28 @@ class MainWindow(QMainWindow):
         # Mean pattern identity matters (recompute-from-IQ changes it); use a cheap hash.
         mean_id = float(np.sum(self.mean_pattern)) if static_on else None
         return (static_on, mode, mean_id)
+
+    def _static_background_term(self, preserve_mean, ap_bool=None):
+        """The static background the pipeline subtracts or divides by.
+
+        In the absolute-intensity mode (per-pattern stretch and global stretch both off) the
+        raw mean pattern must not be used as is: subtracting it centres every pattern on zero
+        and dividing by it lands every pattern near 1, so the final clip to [0, scale_max]
+        leaves a black pattern with a few bright specks, in the preview and in the saved file.
+        Following pyebsdindex's backsub (which does `backfit -= mean(backfit)` before
+        `data -= backfit`), the background is made mean-free for "Subtract" and mean-one for
+        "Divide": the shape of the background (bright centre, gradient) is removed while every
+        pattern keeps its own mean brightness, so relative intensity across the scan survives.
+        The mean level is taken over the active (aperture) pixels when an aperture is set.
+        In the stretched modes the per-pattern / global stretch removes any offset, so the
+        raw mean pattern is used there as before (2026-10-19)."""
+        mp = self.mean_pattern
+        if not preserve_mean:
+            return mp
+        level = float(mp[ap_bool].mean()) if ap_bool is not None else float(mp.mean())
+        if self.bg_mode.currentText() == "Subtract":
+            return mp - level
+        return mp / max(level, 1e-10)
 
     def _apply_static_background(self, chunk, mean_dtype=None):
         """Apply ONLY the current STATIC background to a chunk in-memory (no file).
@@ -1333,13 +1361,14 @@ class MainWindow(QMainWindow):
         ap_bool = None
         if ap is not None:
             ap_bool = ap > 0
-        if self.static_bg_chk.isChecked() and self.mean_pattern is not None:
-            if self.bg_mode.currentText() == "Subtract": p = p - self.mean_pattern
-            else: p = p / (self.mean_pattern + 1e-10)
-        if self.dyn_bg_chk.isChecked():
-            p = p - gaussian_filter(p, sigma=self.dyn_sigma.value() / 10.0)
         normalize = self.normalize_chk.isChecked()
         global_stretch = self.global_chk.isChecked()
+        if self.static_bg_chk.isChecked() and self.mean_pattern is not None:
+            bg = self._static_background_term(not (normalize or global_stretch), ap_bool)
+            if self.bg_mode.currentText() == "Subtract": p = p - bg
+            else: p = p / (bg + 1e-10)
+        if self.dyn_bg_chk.isChecked():
+            p = p - gaussian_filter(p, sigma=self.dyn_sigma.value() / 10.0)
         bval, cval = self.bright.value() / 100.0, self.cont.value() / 100.0
         if global_stretch:
             # Dataset-wide stretch: SAME (lo,hi) for every pattern → relative
@@ -1421,7 +1450,7 @@ class MainWindow(QMainWindow):
 
             # Static background (broadcast across batch)
             if use_static:
-                gpu_mean = cp.asarray(self.mean_pattern, dtype=cp.float32)
+                gpu_mean = cp.asarray(self._static_background_term(not unit_domain, ap_bool), dtype=cp.float32)
                 if self.bg_mode.currentText() == "Subtract":
                     d -= gpu_mean
                 else:
@@ -1471,6 +1500,7 @@ class MainWindow(QMainWindow):
             # sub-batches across a thread pool; see _cpu_pipeline_threaded.
             result = self._cpu_pipeline_threaded(chunk, mask_rows, progress=progress,
                 use_static=use_static, bg_subtract=(self.bg_mode.currentText() == "Subtract"),
+                static_bg=(self._static_background_term(not unit_domain, ap_bool) if use_static else None),
                 use_dyn=use_dyn, use_clahe=use_clahe, normalize=normalize,
                 global_stretch=global_stretch, unit_domain=unit_domain, sigma=sigma,
                 bval=bval, cval=cval, clip_limit=clip_limit, ap_bool=ap_bool,
@@ -1520,7 +1550,8 @@ class MainWindow(QMainWindow):
 
     def _cpu_pipeline_subbatch(self, sub, mask_sub, use_static, bg_subtract, use_dyn, use_clahe,
                                normalize, global_stretch, unit_domain, sigma, bval, cval,
-                               clip_limit, ap_bool, g_lo, g_hi, scale_max=255.0, dtype_max=255.0):
+                               clip_limit, ap_bool, g_lo, g_hi, scale_max=255.0, dtype_max=255.0,
+                               static_bg=None):
         """CPU processing chain for one sub-batch (n, ph, pw) float64 -> float64 in
         [0, dtype_max] (unit domain) or [0, scale_max] (absolute intensity).
         This is the original CPU fallback of _process_chunk_batch plus its CLAHE loop and
@@ -1529,10 +1560,11 @@ class MainWindow(QMainWindow):
         result = sub.copy()
         n = result.shape[0]
         if use_static:
+            bg = self.mean_pattern if static_bg is None else static_bg   # see _static_background_term
             if bg_subtract:
-                result -= self.mean_pattern
+                result -= bg
             else:
-                result /= (self.mean_pattern + 1e-10)
+                result /= (bg + 1e-10)
         if use_dyn:
             # sigma=(0, s, s): first axis is the batch
             result -= gaussian_filter(result, sigma=(0, sigma, sigma))
@@ -2259,13 +2291,17 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self):
         central = QWidget(); self.setCentralWidget(central); main_lay = QHBoxLayout(central)
-        ctrl = QWidget(); ctrl.setFixedWidth(310); cl = QVBoxLayout(ctrl)
+        # The control column sits in a horizontal splitter next to the plots (2026-10-19): drag the
+        # divider to widen or narrow it. The column takes the width the splitter gives it (its
+        # layout does not impose the width of its longest row), and the fields shrink with it.
+        ctrl = _ControlPanel(); cl = QVBoxLayout(ctrl)
+        cl.setSizeConstraint(QLayout.SetNoConstraint)
         # Wrap ctrl in a scroll area so the window's minimum height isn't tied to
         # the sum of every control's minimum size (otherwise this exceeds 1440p displays).
         ctrl_scroll = QScrollArea()
         ctrl_scroll.setWidget(ctrl)
         ctrl_scroll.setWidgetResizable(True)
-        ctrl_scroll.setFixedWidth(330)  # 310 content + ~20 for vertical scrollbar
+        ctrl_scroll.setMinimumWidth(300)
         ctrl_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         ctrl_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         ctrl_scroll.setFrameShape(0)  # no frame border (QFrame.NoFrame == 0)
@@ -2453,7 +2489,20 @@ class MainWindow(QMainWindow):
         bot_lay.addWidget(self.raw_canvas); bot_lay.addWidget(self.proc_canvas)
         splitter.addWidget(top_widget); splitter.addWidget(bot_widget)
         splitter.setStretchFactor(0, 1); splitter.setStretchFactor(1, 1); splitter.setSizes([450, 450])
-        main_lay.addWidget(ctrl_scroll); main_lay.addWidget(splitter, stretch=1)
+        panel_split = QSplitter(Qt.Horizontal)
+        panel_split.addWidget(ctrl_scroll); panel_split.addWidget(splitter)
+        panel_split.setCollapsible(0, False); panel_split.setCollapsible(1, False)
+        panel_split.setStretchFactor(0, 0); panel_split.setStretchFactor(1, 1)
+        panel_split.setHandleWidth(8); panel_split.setSizes([330, 1070])
+        self.panel_splitter = panel_split
+        main_lay.addWidget(panel_split)
+        # Fields take the width their column has instead of the width of their contents, so a
+        # narrow column elides a long combo text rather than pushing the column wider.
+        for w in ctrl.findChildren((QComboBox, QSpinBox, QDoubleSpinBox)):
+            pol = w.sizePolicy(); pol.setHorizontalPolicy(QSizePolicy.Ignored); w.setSizePolicy(pol)
+            w.setMinimumWidth(60)
+        for w in ctrl.findChildren(QLabel):
+            w.setWordWrap(True)
 
 
 if __name__ == '__main__':
