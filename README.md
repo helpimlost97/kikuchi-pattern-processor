@@ -82,6 +82,28 @@ turned out to be useful enough to publish.
 - The control column on the left sits in a splitter: drag the divider to resize it.
 - `MainWindow.unload()` drops the loaded data set and everything derived from it (used by
   the spherical indexing workbench so that only one data set is in memory at a time).
+- **Montage batch API** (v1.7.0, no dialogs, for a montage whose tiles are separate
+  pattern files; the workbench drives it with a Cancel button). Everything runs in the
+  GUI thread and keeps the status bar alive, like `Apply && Save`:
+  - `MainWindow.compute_shared_background(paths, progress=None)` returns the mean
+    pattern (float64) over all patterns of all the files, streamed in chunks without
+    loading any of them, and keeps it as `self.shared_background`. All files must have
+    the same pattern size and bit depth (else `ValueError` naming the file).
+  - `MainWindow.save_processed(path, progress=None, cancel=None)` is `Apply && Save`
+    without the file dialog: the loaded data set, current settings, source header copied
+    byte for byte. Returns `dict(path, n_saved, n_total, seconds, source_label)`. When
+    `cancel()` returns True between chunks, the partial file is deleted and
+    `BatchCancelled` is raised.
+  - `MainWindow.batch_process(jobs, shared_background=None, progress=None, cancel=None)`
+    takes `[(source, output), ...]` and, per file, loads it, puts in the shared
+    background, runs the full NLPAR if `NLPAR: Enable Preview` is checked (SR and λ from
+    the panel: the λ optimized on the preview tile is reused), saves it, and unloads it
+    so the next file starts from empty RAM. The IQ-range sliders apply per tile, as
+    fractions of that tile's IQ range. A failed file is recorded (`ok: False`, `error`)
+    and the batch goes on. The per-file results (`source, output, ok, error, n_saved,
+    n_total, seconds, n_excluded`) are returned and kept in `self.batch_results`.
+    pyebsdindex's CPU NLPAR crashes on scans with fewer than 2·SR+1 rows, so the batch
+    fails such a tile with an error instead (e.g. 3-row tiles need SR = 1).
 - **OIM-compatible UP1/UP2 output**: pyebsdindex's `write_data` only emits the
   42-byte standard header, but v4 UP1 files have additional bytes between byte
   42 and `filePos`. This tool copies those bytes verbatim from the source file

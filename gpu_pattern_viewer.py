@@ -1,4 +1,4 @@
-__version__ = "1.6.1.dev1"   # shown in the window title; bump with each release (git tag v<version>)
+__version__ = "1.7.0.dev1"   # shown in the window title; bump with each release (git tag v<version>)
 import sys
 import os
 import gc
@@ -509,6 +509,11 @@ class RamOutUPFile(RamUPFile):
     def write_datamaxmin(self): pass
 
 
+class BatchCancelled(Exception):
+    """Raised by MainWindow.save_processed / batch_process when the caller's `cancel()`
+    returned True. The partial output file of the interrupted save has been deleted."""
+
+
 class _ControlPanel(QWidget):
     """The control column: never asks for more width than the splitter gives it."""
     def minimumSizeHint(self):
@@ -571,6 +576,13 @@ class MainWindow(QMainWindow):
         self.global_lo = None
         self.global_hi = None
         self._global_range_key = None
+        # Montage batch (v1.7.0): the mean pattern over all tiles from
+        # compute_shared_background (with the tuple of paths it was computed from), and the
+        # per-job result dicts of the last batch_process call.
+        self.shared_background = None
+        self.shared_background_key = None
+        self.batch_results = []
+        self._batch_running = False
         self._build_ui()
 
     def _remove_temp_files(self):
@@ -655,6 +667,16 @@ class MainWindow(QMainWindow):
             self._aperture_cache_key = key
         return self._aperture_cache
 
+    @staticmethod
+    def _host_chunk_budget():
+        """Default host-RAM byte budget for one chunk of a whole-dataset pass.
+        Was min(3 GB, 25% of available). On a 500 GB HPC node that meant 1-row chunks
+        (a 430-col 479x479 row is ~1.8 GB at 18 B/px), starving the threaded paths.
+        Scale the cap with the thread count, but never exceed a quarter of what the
+        SLURM cgroup actually lets us allocate. Split out of _host_chunk_rows (v1.7.0) so
+        compute_shared_background can size its chunks for files that are not loaded."""
+        return min(1.0e9 * max(4, n_workers() // 2), 0.25 * available_ram())
+
     def _host_chunk_rows(self, bytes_per_pixel_live, budget=None, n_rows_total=None):
         """Rows per chunk that keep host RAM for one chunk inside `budget` bytes.
 
@@ -665,11 +687,7 @@ class MainWindow(QMainWindow):
         the smaller of 3 GB and a quarter of the currently AVAILABLE RAM, so a busy machine
         chunks smaller instead of swapping (or dying with _ArrayMemoryError)."""
         if budget is None:
-            # Was min(3 GB, 25% of available). On a 500 GB HPC node that meant 1-row chunks
-            # (a 430-col 479x479 row is ~1.8 GB at 18 B/px), starving the threaded paths.
-            # Scale the cap with the thread count, but never exceed a quarter of what the
-            # SLURM cgroup actually lets us allocate.
-            budget = min(1.0e9 * max(4, n_workers() // 2), 0.25 * available_ram())
+            budget = self._host_chunk_budget()
         ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
         bytes_per_row = self.ncols * ph * pw * float(bytes_per_pixel_live)
         n_total = n_rows_total if n_rows_total is not None else self.nrows
@@ -1995,7 +2013,7 @@ class MainWindow(QMainWindow):
 
         self._apply_nlpar_pyebsdindex(sr, lam)
 
-    def _apply_nlpar_pyebsdindex(self, sr, lam):
+    def _apply_nlpar_pyebsdindex(self, sr, lam, raise_errors=False):
         """Full-dataset NLPAR through pyebsdindex, straight off self.orig_path (or the
         in-RAM copy) — no temp copy of the input. pyebsdindex resolved the engine at
         import (NLPAR_ENGINE): its OpenCL kernels when pyopencl sees a GPU, numba on the
@@ -2019,7 +2037,10 @@ class MainWindow(QMainWindow):
         `fileout=` (setoutfile -> copy_file(empty_data=True) clones the header and
         reserves the file, then each tile is written in place). Without `fileout`
         pyebsdindex names the file itself as `<stem>_NLPAR_l{lam}sr{sr}.up1`, so the
-        glob below is kept as a fallback."""
+        glob below is kept as a fallback.
+
+        raise_errors=True (batch_process, v1.7.0): a failure is raised to the caller
+        instead of being shown in a modal QMessageBox, which would block a headless batch."""
         label, engine = ("GPU" if NLPAR_ON_GPU else "CPU"), NLPAR_ENGINE
         try:
             self.statusBar().showMessage(f"Running NLPAR batch, {NLPAR_ENGINE} (SR={sr}, lam={lam:.2f})..."); QApplication.processEvents()
@@ -2105,11 +2126,15 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(f"NLPAR batch complete ({elapsed:.1f}s, {engine}, N_p={N_p})")
                 print(f"[NLPAR {label}] done in {elapsed:.1f}s -> {result_path}")
             else:
+                if raise_errors:
+                    raise RuntimeError("NLPAR ran but output not found.")
                 QMessageBox.warning(self, "Warning", "NLPAR ran but output not found.")
             self.update_display()
         except Exception as e:
             import traceback; traceback.print_exc()
             self.statusBar().showMessage(f"NLPAR ({NLPAR_ENGINE}) failed")
+            if raise_errors:
+                raise
             QMessageBox.critical(self, f"NLPAR ({NLPAR_ENGINE}) failed", str(e))
 
     # Old name, still used by osc_selftest.py / osc_gpu_selftest.py (rewritten in Phase 4).
@@ -2136,7 +2161,8 @@ class MainWindow(QMainWindow):
     def apply_and_save(self):
         """Save all processed patterns to a new UP1/UP2 file (chunked). The output keeps
         the source's extension and bit depth: pyebsdindex (and OIM) take the dtype from
-        the extension, so a .up2 source is always written as a .up2."""
+        the extension, so a .up2 source is always written as a .up2. The GUI side (checks,
+        file dialog, final message box) lives here; the work is save_processed (v1.7.0)."""
         if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1/UP2 file first"); return
         if self.nlpar_chk.isChecked() and self.f_nlpar is None:
             QMessageBox.information(self, "NLPAR not applied to full dataset",
@@ -2161,6 +2187,40 @@ class MainWindow(QMainWindow):
         # "XCB error: 3 (BadWindow) ... TranslateCoords" for the already-destroyed dialog
         # window. Harmless, but it reads like a failure (2026-10-10).
         for _ in range(3): QApplication.processEvents()
+        r = self.save_processed(path)
+        QMessageBox.information(self, "Saved",
+            f"Processed patterns saved to:\n{r['path']}\n\nSource: {r['source_label']}\nMode: {'GPU' if HAS_GPU else 'CPU'}\nPatterns: {r['n_saved']}/{r['n_total']}\nTime: {r['seconds']:.1f}s")
+
+    def save_processed(self, path, progress=None, cancel=None):
+        """Process the whole loaded data set with the CURRENT widget states and write it to
+        `path`, without any dialog (v1.7.0; the body of the former apply_and_save). Used by
+        apply_and_save and batch_process.
+
+        The source header is copied byte for byte (a v4 header's map GUID and extra bytes
+        survive), the file is pre-sized with a sparse truncate and filled chunk by chunk.
+        The output extension is forced to the source's (bit depth). Patterns outside the IQ
+        range are written as zeros. If an NLPAR result is loaded (self.f_nlpar) it is the
+        processing source.
+
+        progress(done_patterns, total_patterns): called after each chunk is written.
+        cancel(): checked before each chunk; when it returns True the partial output file
+        is deleted and BatchCancelled is raised.
+        Returns dict(path, n_saved, n_total, seconds, source_label).
+        Raises RuntimeError when nothing is loaded or NLPAR is checked but not applied,
+        ValueError when `path` is the loaded source file."""
+        if self.f_orig is None:
+            raise RuntimeError("no UP1/UP2 file loaded")
+        if self.nlpar_chk.isChecked() and self.f_nlpar is None:
+            raise RuntimeError("NLPAR is enabled but has not been applied to the full data set")
+        ext = self.src_ext
+        path = os.path.abspath(path)
+        if os.path.splitext(path)[1].lower() != ext:
+            # A different extension would change the bit depth the file is read with.
+            path = os.path.splitext(path)[0] + ext
+            print(f"[SAVE] output extension forced to {ext} (same bit depth as the source)")
+        if os.path.abspath(path) == os.path.abspath(self.orig_path) or \
+                (os.path.exists(path) and os.path.samefile(path, self.orig_path)):
+            raise ValueError(f"{path}: cannot overwrite the loaded source file")
         self.statusBar().showMessage(f"Processing all patterns ({'GPU' if HAS_GPU else 'CPU'})..."); QApplication.processEvents()
         t0 = time.time()
         mask = self._get_iq_mask()
@@ -2226,6 +2286,17 @@ class MainWindow(QMainWindow):
         mask_flat = mask.reshape(-1)
         n_saved = 0
         for row_start in range(0, n_rows_out, CHUNK_ROWS):
+            if cancel is not None and cancel():
+                # Between chunks: drop the partial output (header + the chunks so far, the
+                # rest a sparse hole) so nothing downstream mistakes it for a result.
+                del out_obj
+                try:
+                    os.remove(path)
+                except OSError as e:
+                    print(f"[SAVE] could not remove the partial output {path}: {e}")
+                print(f"[SAVE] cancelled at row {row_start}/{n_rows_out}; partial output removed")
+                self.statusBar().showMessage(f"Save cancelled at row {row_start}/{n_rows_out}; partial output removed")
+                raise BatchCancelled(f"save of {path} cancelled at row {row_start}/{n_rows_out}")
             rows_to_read = min(CHUNK_ROWS, n_rows_out - row_start)
             p0 = row_start * ncols
             p1 = min((row_start + rows_to_read) * ncols, n_out)
@@ -2262,11 +2333,252 @@ class MainWindow(QMainWindow):
             print(f"[SAVE] rows {row_start + rows_to_read}/{n_rows_out} done ({time.time() - t0:.0f}s)")
             self.statusBar().showMessage(f"Saving: row {row_start + rows_to_read}/{n_rows_out}")
             QApplication.processEvents()
+            if progress is not None:
+                progress(p1, n_out)
         elapsed = time.time() - t0
         n_total = n_out
         self.statusBar().showMessage(f"Saved to {os.path.basename(path)} ({elapsed:.1f}s)")
-        QMessageBox.information(self, "Saved",
-            f"Processed patterns saved to:\n{path}\n\nSource: {src_label}\nMode: {'GPU' if HAS_GPU else 'CPU'}\nPatterns: {n_saved}/{n_total}\nTime: {elapsed:.1f}s")
+        return dict(path=path, n_saved=n_saved, n_total=n_total, seconds=elapsed, source_label=src_label)
+
+    # ---- Montage batch (v1.7.0) ----
+    # A montage is one scan split into many pattern files ("tiles"). The three methods
+    # below process all tiles headlessly with the settings the user chose on a preview
+    # tile: compute_shared_background (one static background for every tile, so the
+    # background subtraction does not change from tile to tile), save_processed (Apply &&
+    # Save without the dialog) and batch_process (load -> [NLPAR] -> save -> unload per
+    # tile). Everything runs in the GUI thread and pumps the event loop, like the other
+    # long passes; the caller provides `cancel` (e.g. from a button).
+    def compute_shared_background(self, paths, progress=None):
+        """Mean pattern (float64, (ph, pw)) over ALL patterns of ALL files in `paths`
+        (.up1/.up2), streamed in chunks sized like recompute_background (never a whole
+        file in RAM). The GUI state (loaded data set, plots) is not touched.
+
+        Every file must have the pattern size and dtype of the first, else ValueError
+        naming the file. The patterns a file actually holds are used: a map stopped early
+        has fewer than nRows*nCols, (size - header) // (ph*pw*bytes), as in load_path.
+        Unlike load_path's own mean (whole rows only), a trailing partial row is included.
+        progress(done_patterns, total_patterns, path) is called per chunk.
+        The result is also stored as self.shared_background (self.shared_background_key =
+        tuple(paths)) for batch_process."""
+        paths = list(paths)
+        if not paths:
+            raise ValueError("compute_shared_background: no files given")
+        files = []                       # (path, data offset, n_patterns, ncols)
+        ref = None
+        for p in paths:
+            p = str(p)
+            if not os.path.isfile(p):
+                raise FileNotFoundError(f"{p}: file not found")
+            f = ebsd_pattern.get_pattern_file_obj(p)
+            ph, pw = int(f.patternH), int(f.patternW)
+            dt = np.dtype(f.filedatatype)
+            hdr = int(getattr(f, 'filePos', 42) or 0)
+            ncols, nrows = int(f.nCols), int(f.nRows)
+            del f
+            if ref is None:
+                ref = (ph, pw, dt, p)
+            elif (ph, pw) != ref[:2]:
+                raise ValueError(f"{p}: patterns are {pw}x{ph} px, but {os.path.basename(ref[3])} "
+                                 f"has {ref[1]}x{ref[0]} px; all files must have the same pattern size")
+            elif dt != ref[2]:
+                raise ValueError(f"{p}: patterns are {dt.name}, but {os.path.basename(ref[3])} "
+                                 f"has {ref[2].name}; all files must have the same bit depth")
+            n_pat = int((int(os.path.getsize(p)) - hdr) // (ph * pw * dt.itemsize))
+            n_pat = max(0, min(n_pat, nrows * ncols))
+            files.append((p, hdr, n_pat, max(ncols, 1)))
+        ph, pw, dt = ref[0], ref[1], ref[2]
+        total = sum(f[2] for f in files)
+        if total == 0:
+            raise ValueError("compute_shared_background: the files hold no patterns")
+        # Same sizing as recompute_background: native read + slack, 3 B/px live (the float64
+        # sum is a buffered reduction, it never materialises a float64 copy of the chunk).
+        budget = self._host_chunk_budget()
+        pat_bytes = ph * pw * dt.itemsize
+        t0 = time.time()
+        print(f"[SHARED BG] {len(files)} files, {total} patterns of {ph}x{pw} px ({dt.name})")
+        self.statusBar().showMessage(f"Shared background: {len(files)} files, {total} patterns..."); QApplication.processEvents()
+        acc = np.zeros((ph, pw), dtype=np.float64)
+        done = 0
+        for k, (p, hdr, n_pat, ncols) in enumerate(files):
+            rows = max(1, int(budget // max(ncols * ph * pw * 3.0, 1)))
+            step = rows * ncols                       # whole scan rows per chunk
+            for q0 in range(0, n_pat, step):
+                n = min(step, n_pat - q0)
+                chunk = read_patterns_parallel(p, hdr + q0 * pat_bytes, n, ph, pw, dt)
+                acc += chunk.sum(axis=0, dtype=np.float64)
+                del chunk
+                done += n
+                self.statusBar().showMessage(
+                    f"Shared background: {os.path.basename(p)} ({k + 1}/{len(files)}), "
+                    f"{done}/{total} patterns")
+                QApplication.processEvents()
+                if progress is not None:
+                    progress(done, total, p)
+        mean = acc / total
+        self.shared_background = mean
+        self.shared_background_key = tuple(paths)
+        el = time.time() - t0
+        print(f"[SHARED BG] mean over {total} patterns of {len(files)} files in {el:.1f}s")
+        self.statusBar().showMessage(f"Shared background: {total} patterns of {len(files)} files ({el:.1f}s)")
+        return mean
+
+    def batch_process(self, jobs, shared_background=None, progress=None, cancel=None):
+        """Process several pattern files with the current widget settings, one after the
+        other: `jobs` is a list of (source_path, output_path). Per job:
+
+          load_path(source)  -> the tile's own IQ map; the IQ-range sliders (fractions of
+                                each tile's IQ range) are re-applied after the load, which
+                                resets them to the full range
+          shared_background  -> if given, replaces the tile's mean pattern (static bg)
+          NLPAR              -> if 'NLPAR: Enable Preview' was checked when the batch
+                                started: full-data-set NLPAR with the current SR / lambda
+                                (lambda optimized on the preview tile is reused)
+          save_processed(output)   (output folder created if missing)
+          unload() + gc.collect()  -> nothing of the tile stays in RAM
+
+        A failing job (other than BatchCancelled) is printed, recorded with ok=False and
+        the batch goes on (a partial output of a failed save is deleted). cancel() is
+        checked between stages and between save chunks; on cancel the tile is unloaded
+        and BatchCancelled re-raised, with the finished jobs in self.batch_results.
+        progress(job_index, n_jobs, source_path, stage), stage in load/nlpar/save/done.
+        Returns the list of result dicts (source, output, ok, error, n_saved, n_total,
+        seconds, n_excluded), also kept as self.batch_results."""
+        if self._nlpar_busy:
+            raise RuntimeError("NLPAR is running: wait for it to finish before starting a batch")
+        if self._batch_running:
+            raise RuntimeError("a batch is already running")
+        jobs = [(str(s), str(o)) for s, o in jobs]
+        n_jobs = len(jobs)
+        self.batch_results = []
+        if shared_background is not None:
+            shared_background = np.array(shared_background, dtype=np.float64, copy=True)
+        # Settings captured once: load_path resets the IQ sliders, _apply_nlpar_pyebsdindex
+        # unchecks the NLPAR box after a successful run.
+        use_nlpar = self.nlpar_chk.isChecked()
+        iq_lo, iq_hi = self.iq_min_slider.value(), self.iq_max_slider.value()
+        sr, lam = int(self.sr_spin.value()), float(self.lam_spin.value())
+
+        def report(i, src, stage):
+            if progress is not None:
+                progress(i, n_jobs, src, stage)
+
+        def check_cancel(i, src, where):
+            if cancel is not None and cancel():
+                raise BatchCancelled(f"batch cancelled at job {i + 1}/{n_jobs} ({os.path.basename(src)}, {where})")
+
+        bg_desc = ("off" if not self.static_bg_chk.isChecked() else
+                   f"{self.bg_mode.currentText()}, {'shared over all tiles' if shared_background is not None else 'per tile'}")
+        print(f"[BATCH] {n_jobs} jobs; static bg: {bg_desc}; dynamic bg: {self.dyn_bg_chk.isChecked()}; "
+              f"per-pattern stretch: {self.normalize_chk.isChecked()}; global stretch: {self.global_chk.isChecked()}; "
+              f"CLAHE: {self.clahe_chk.isChecked()}; IQ range: {iq_lo / 10:.1f}-{iq_hi / 10:.1f}% of each tile's range; "
+              f"NLPAR: {use_nlpar}")
+        if use_nlpar:
+            print(f"[BATCH] NLPAR SR={sr}, lambda={lam:.3f}: the preview tile's lambda is reused for every tile"
+                  f"{'' if self._lambda_optimized else ' (it was not optimized on the loaded tile)'}")
+        t_batch = time.time()
+        self._batch_running = True
+        if use_nlpar:
+            # Off during the loads, so each load does not run the single-pattern NLPAR
+            # preview; the full-data-set NLPAR below is explicit. Restored at the end.
+            self.nlpar_chk.blockSignals(True); self.nlpar_chk.setChecked(False); self.nlpar_chk.blockSignals(False)
+        try:
+            for i, (src, out) in enumerate(jobs):
+                res = dict(source=src, output=out, ok=False, error=None, n_saved=0, n_total=0,
+                           seconds=0.0, n_excluded=0)
+                t0 = time.time()
+                stage = None; out_abs = None
+                try:
+                    check_cancel(i, src, "before load")
+                    stage = "load"; report(i, src, "load")
+                    src_abs = os.path.abspath(src)
+                    if not os.path.isfile(src_abs):
+                        raise FileNotFoundError(f"{src}: source file not found")
+                    ext = os.path.splitext(src_abs)[1].lower()
+                    out_abs = os.path.abspath(out)
+                    if os.path.splitext(out_abs)[1].lower() != ext:
+                        out_abs = os.path.splitext(out_abs)[0] + ext   # as save_processed does
+                    if out_abs == src_abs or (os.path.exists(out_abs) and os.path.samefile(out_abs, src_abs)):
+                        raise ValueError(f"{out}: output path is the source file")
+                    self.statusBar().showMessage(f"Batch {i + 1}/{n_jobs}: loading {os.path.basename(src)}")
+                    QApplication.processEvents()
+                    self.load_path(src_abs)
+                    if self.f_orig is None or self.orig_path != src_abs:
+                        raise RuntimeError(f"{src}: load failed")
+                    for sl, v in ((self.iq_min_slider, iq_lo), (self.iq_max_slider, iq_hi)):
+                        sl.blockSignals(True); sl.setValue(v); sl.blockSignals(False)
+                    self._update_iq_range()
+                    if shared_background is not None:
+                        ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
+                        if shared_background.shape != (ph, pw):
+                            raise ValueError(f"{src}: patterns are {pw}x{ph} px, the shared background is "
+                                             f"{shared_background.shape[1]}x{shared_background.shape[0]}")
+                        self.mean_pattern = shared_background.copy()
+                        self.bg_status.setText("Background: shared, all tiles")
+                        # Global-stretch bounds are computed in the bg-applied domain and keyed
+                        # on the mean pattern (_bg_config_key); nothing else caches it.
+                        self._invalidate_global_range()
+                    check_cancel(i, src, "after load")
+                    if use_nlpar:
+                        stage = "nlpar"; report(i, src, "nlpar")
+                        # pyebsdindex's CPU NLPAR crashes the whole process (segfault, not an
+                        # exception) when the scan has fewer than 2*SR+1 rows: seen with
+                        # pyebsdindex 0.3.10.1 on 3-row montage tiles at SR >= 2, 4-row at SR=2
+                        # (and in the GUI's own NLPAR too). Fail this job instead of the batch.
+                        n_rows_nl = int(getattr(self, 'n_actual_rows', self.nrows))
+                        if min(n_rows_nl, int(self.ncols)) < 2 * sr + 1:
+                            raise ValueError(f"{src}: NLPAR with search radius {sr} needs at least "
+                                             f"{2 * sr + 1} scan rows and columns; this file has "
+                                             f"{int(self.ncols)} x {n_rows_nl}. Use SR <= "
+                                             f"{max((min(n_rows_nl, int(self.ncols)) - 1) // 2, 0)}.")
+                        # Sigma first, as in the GUI, where Optimize Lambda (or the preview)
+                        # has always computed it before the batch: calcnlpar would otherwise
+                        # estimate sigma inline, tile by tile, and give a different result.
+                        self._ensure_sigma_map()
+                        self._apply_nlpar_pyebsdindex(sr, lam, raise_errors=True)
+                        if self.f_nlpar is None:
+                            raise RuntimeError(f"{src}: NLPAR produced no result")
+                        check_cancel(i, src, "after NLPAR")
+                    stage = "save"; report(i, src, "save")
+                    os.makedirs(os.path.dirname(out_abs), exist_ok=True)
+                    self.statusBar().showMessage(f"Batch {i + 1}/{n_jobs}: saving {os.path.basename(out_abs)}")
+                    QApplication.processEvents()
+                    r = self.save_processed(out_abs, cancel=cancel)
+                    res.update(output=r['path'], ok=True, n_saved=int(r['n_saved']), n_total=int(r['n_total']),
+                               n_excluded=int(r['n_total']) - int(r['n_saved']))
+                    print(f"[BATCH] {i + 1}/{n_jobs} {os.path.basename(src)} -> {r['path']}: "
+                          f"{r['n_saved']}/{r['n_total']} patterns ({res['n_excluded']} outside the IQ range), "
+                          f"source {r['source_label']}, {time.time() - t0:.1f}s")
+                except BatchCancelled:
+                    raise
+                except Exception as e:
+                    import traceback; traceback.print_exc()
+                    res['error'] = f"{type(e).__name__}: {e}"
+                    print(f"[BATCH] {i + 1}/{n_jobs} {src} FAILED ({stage or 'setup'}): {res['error']}")
+                    if stage == "save" and out_abs and os.path.isfile(out_abs):
+                        try:
+                            os.remove(out_abs); print(f"[BATCH] removed the partial output {out_abs}")
+                        except OSError:
+                            pass
+                finally:
+                    if not self.unload():
+                        print("[BATCH] warning: unload refused (an NLPAR call is in flight)")
+                    gc.collect()
+                res['seconds'] = time.time() - t0
+                self.batch_results.append(res)
+                report(i, src, "done")
+        except BatchCancelled as e:
+            print(f"[BATCH] {e}; {len(self.batch_results)} of {n_jobs} jobs finished")
+            self.statusBar().showMessage(f"Batch cancelled: {len(self.batch_results)} of {n_jobs} jobs finished")
+            raise
+        finally:
+            self._batch_running = False
+            if use_nlpar:
+                self.nlpar_chk.blockSignals(True); self.nlpar_chk.setChecked(True); self.nlpar_chk.blockSignals(False)
+        n_ok = sum(1 for r in self.batch_results if r['ok'])
+        el = time.time() - t_batch
+        print(f"[BATCH] done: {n_ok}/{n_jobs} ok in {el:.1f}s")
+        self.statusBar().showMessage(f"Batch done: {n_ok}/{n_jobs} files saved ({el:.0f}s)")
+        return self.batch_results
 
     def _update_iq_range(self):
         if self.iq_map is None: return
