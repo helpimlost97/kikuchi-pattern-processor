@@ -1,4 +1,4 @@
-__version__ = "1.7.0.dev1"   # shown in the window title; bump with each release (git tag v<version>)
+__version__ = "1.7.0.dev2"   # shown in the window title; bump with each release (git tag v<version>)
 import sys
 import os
 import gc
@@ -410,14 +410,15 @@ class RamUPFile(ebsd_pattern.UPFile):
         super().__init__(path)
         self.read_header()
         self._ram = ram                      # (n_patterns, ph, pw) view, native dtype
-        self.exclude = None                  # optional (nPatterns,) bool: serve these as zeros
+        self.exclude = None                  # optional (nPatterns,) bool: serve these as constant patterns
 
     def _apply_exclude(self, pats, idx):
         """Phase 3 IQ-range exclusion without touching pyebsdindex: excluded patterns are
         served as a constant pattern of value 1. Together with sigma = 0 at those positions
         (set by the batch) their normalised distance to any real pattern is enormous, so
         their weight is exp(-huge) = 0: they are dropped as neighbours. Their own output is
-        that constant pattern, which the batch overwrites with zeros. Value 1 rather than 0:
+        that constant pattern, which the batch replaces by the original, unprocessed pattern
+        (_restore_excluded_output) so that they stay in the data set. Value 1 rather than 0:
         pyebsdindex's calcnlpar_cl treats an all-zero output pattern as the Apple-silicon
         GPU failure and recomputes the tile up to three times (code review 2026-10-13).
         See PLAN_NLPAR_PYEBSDINDEX.md, Phase 3."""
@@ -470,8 +471,8 @@ class RamUPFile(ebsd_pattern.UPFile):
 
 class MaskedUPFile(ebsd_pattern.UPFile):
     """Streamed-mode twin of RamUPFile's exclusion: a real pyebsdindex UPFile whose
-    returnArrayOnly reads zero the patterns flagged in `exclude` (same contract as
-    RamUPFile._apply_exclude). Everything else is pyebsdindex's own file code."""
+    returnArrayOnly reads serve the patterns flagged in `exclude` as constant patterns
+    (same contract as RamUPFile._apply_exclude). Everything else is pyebsdindex's own file code."""
     def __init__(self, path):
         super().__init__(path)
         self.read_header()
@@ -1442,8 +1443,13 @@ class MainWindow(QMainWindow):
         the uint8/uint16 write. Mirrors process_pattern: when normalize (or global stretch)
         is on, internal range is [0,1] and we scale to the full dtype range (255 / 65535)
         at the end; when off, internal range stays in absolute intensity and we clip to
-        scale_max."""
+        scale_max. Patterns with mask_rows False (outside the IQ range) are returned as
+        they came in, unprocessed: they take no part in the statistics (background mean,
+        global stretch range, NLPAR sigma and neighbours), but they stay in the data set
+        so that they can still be indexed."""
         N = chunk.shape[0]
+        excluded = ~np.asarray(mask_rows, dtype=bool)
+        raw_excluded = chunk[excluded] if excluded.any() else None   # copy, before any pipeline touches the chunk
         use_static = self.static_bg_chk.isChecked() and self.mean_pattern is not None
         use_dyn = self.dyn_bg_chk.isChecked()
         use_clahe = self.clahe_chk.isChecked()
@@ -1525,7 +1531,8 @@ class MainWindow(QMainWindow):
                 bval=bval, cval=cval, clip_limit=clip_limit, ap_bool=ap_bool,
                 g_lo=(g_lo if global_stretch else None), g_hi=(g_hi if global_stretch else None),
                 scale_max=float(self.scale_max), dtype_max=float(self.dtype_max))
-            result[~mask_rows] = 0.0
+            if raw_excluded is not None:
+                result[excluded] = raw_excluded
             return result
 
         # CLAHE stays on CPU (per-pattern, no good batch GPU impl yet).
@@ -1563,8 +1570,9 @@ class MainWindow(QMainWindow):
         # statistics gate only (min/max, global stretch bounds, CLAHE source range,
         # N_p in NLPAR); masked pixels keep their own processed values and reach disk
         # intact, so exported patterns are complete for OIM/EMSphInx/OpenXY.
-        # IQ-range exclusion below is a different thing and still zeroes whole patterns.
-        result[~mask_rows] = 0.0
+        # IQ-range exclusion is a different thing: those whole patterns go out unprocessed.
+        if raw_excluded is not None:
+            result[excluded] = raw_excluded
         return result
 
     def _cpu_pipeline_subbatch(self, sub, mask_sub, use_static, bg_subtract, use_dyn, use_clahe,
@@ -1674,7 +1682,10 @@ class MainWindow(QMainWindow):
                                      vmin=0, vmax=self.scale_max)
         if self.current_row >= self.nrows or self.current_col >= self.ncols: return  # stale click from a larger scan
         if self.iq_mask is not None and not self.iq_mask[self.current_row, self.current_col]:
-            self.proc_canvas.show_pattern(None, "Excluded by IQ range"); return
+            # Outside the IQ range: the batch writes this pattern unprocessed, so show it as it is
+            self.proc_canvas.show_pattern(orig, f"Outside IQ range: kept unprocessed [{self.current_col}, {self.current_row}]",
+                                          vmin=0, vmax=self.scale_max)
+            return
         t0 = time.time()
         base_pat = self._get_base_pattern()
         processed = self.process_pattern(base_pat)
@@ -2060,8 +2071,9 @@ class MainWindow(QMainWindow):
             budget = self._nlpar_chunk_bytes()      # CPU tiles; the OpenCL path sizes its own
             # IQ-range exclusion (Phase 3): excluded patterns are served to pyebsdindex as
             # constant patterns with sigma 0, which gives them zero weight as neighbours (see
-            # RamUPFile._apply_exclude); their own output is zeroed below. The true sigma
-            # map is put back afterwards so preview / lambda keep using it.
+            # RamUPFile._apply_exclude); their own output is replaced by the original pattern
+            # below, so they stay in the result unprocessed. The true sigma map is put back
+            # afterwards so preview / lambda keep using it.
             excl = self._nlpar_exclusion()
             if excl is not None and (nlobj.sigma is None or np.asarray(nlobj.sigma).ndim != 2):
                 # Sigma must come from the real patterns, not from the constant-served ones
@@ -2080,7 +2092,7 @@ class MainWindow(QMainWindow):
             true_sigma = nlobj.sigma
             if excl is not None:
                 print(f"[NLPAR {label}] IQ range excludes {int(excl.sum())} of {excl.size} patterns "
-                      f"(served as constant patterns, sigma 0, output zeroed)")
+                      f"(served as constant patterns, sigma 0; kept unprocessed in the result)")
                 self._nl_infile.exclude = excl
                 if true_sigma is not None and np.asarray(true_sigma).ndim == 2:
                     s = np.array(true_sigma, dtype=np.float32, copy=True)
@@ -2102,7 +2114,7 @@ class MainWindow(QMainWindow):
                                                   # whatever calcnlpar computed for later reuse
             finish()
             if excl is not None and (to_ram or (result_path and os.path.isfile(result_path))):
-                self._zero_excluded_output(excl, self.nlpar_patterns if to_ram else result_path, ph, pw)
+                self._restore_excluded_output(excl, self.nlpar_patterns if to_ram else result_path)
             if to_ram:
                 elapsed = time.time() - t0
                 self.f_nlpar = RamUPFile(self.orig_path, self.nlpar_patterns)
@@ -2140,23 +2152,25 @@ class MainWindow(QMainWindow):
     # Old name, still used by osc_selftest.py / osc_gpu_selftest.py (rewritten in Phase 4).
     _apply_nlpar_cpu = _apply_nlpar_pyebsdindex
 
-    def _zero_excluded_output(self, excl, target, ph, pw):
-        """Write zero patterns at the excluded positions of the batch result. `target` is
-        the in-RAM result array or the path of the result file. The kernel already
-        produces (near-)zero patterns there (zero centre with weight 1, neighbours at
-        exp(-huge)); this makes it exact and independent of lambda."""
+    def _restore_excluded_output(self, excl, target):
+        """Put the ORIGINAL patterns back at the excluded positions of the NLPAR batch
+        result, so that patterns outside the IQ range stay in the data set unprocessed
+        (they were served to the kernel as constant patterns, whose output is meaningless).
+        `target` is the in-RAM result array or the path of the result file."""
         idx = np.flatnonzero(excl)
         if idx.size == 0:
             return
-        if isinstance(target, np.ndarray):
-            target[idx] = 0
-            return
-        fobj = ebsd_pattern.get_pattern_file_obj(target)
-        # group consecutive indices into runs -> one write_data per run
+        fobj = None if isinstance(target, np.ndarray) else ebsd_pattern.get_pattern_file_obj(target)
+        # group consecutive indices into runs -> one read / write per run
         breaks = np.flatnonzero(np.diff(idx) != 1) + 1
         for run in np.split(idx, breaks):
-            z = np.zeros((run.size, ph, pw), dtype=fobj.filedatatype)
-            fobj.write_data(newpatterns=z, patStartCount=[int(run[0]), int(run.size)], writeHead=False)
+            p0, n = int(run[0]), int(run.size)
+            orig = self._read_patterns(self.f_orig, p0, n)
+            if fobj is None:
+                target[p0:p0 + n] = orig
+            else:
+                fobj.write_data(newpatterns=np.ascontiguousarray(orig, dtype=fobj.filedatatype),
+                                patStartCount=[p0, n], writeHead=False)
 
     def apply_and_save(self):
         """Save all processed patterns to a new UP1/UP2 file (chunked). The output keeps
@@ -2199,13 +2213,15 @@ class MainWindow(QMainWindow):
         The source header is copied byte for byte (a v4 header's map GUID and extra bytes
         survive), the file is pre-sized with a sparse truncate and filled chunk by chunk.
         The output extension is forced to the source's (bit depth). Patterns outside the IQ
-        range are written as zeros. If an NLPAR result is loaded (self.f_nlpar) it is the
-        processing source.
+        range are written as they are in the source, unprocessed (they are left out of the
+        statistics, not of the file, so they can still be indexed). If an NLPAR result is
+        loaded (self.f_nlpar) it is the processing source.
 
         progress(done_patterns, total_patterns): called after each chunk is written.
         cancel(): checked before each chunk; when it returns True the partial output file
         is deleted and BatchCancelled is raised.
-        Returns dict(path, n_saved, n_total, seconds, source_label).
+        Returns dict(path, n_saved, n_total, seconds, source_label): n_saved is the number of
+        patterns processed, n_total the number written (n_total - n_saved went out unprocessed).
         Raises RuntimeError when nothing is loaded or NLPAR is checked but not applied,
         ValueError when `path` is the loaded source file."""
         if self.f_orig is None:
@@ -2442,7 +2458,8 @@ class MainWindow(QMainWindow):
         and BatchCancelled re-raised, with the finished jobs in self.batch_results.
         progress(job_index, n_jobs, source_path, stage), stage in load/nlpar/save/done.
         Returns the list of result dicts (source, output, ok, error, n_saved, n_total,
-        seconds, n_excluded), also kept as self.batch_results."""
+        seconds, n_excluded), also kept as self.batch_results; n_excluded patterns were
+        outside the tile's IQ range and are in the output unprocessed."""
         if self._nlpar_busy:
             raise RuntimeError("NLPAR is running: wait for it to finish before starting a batch")
         if self._batch_running:
@@ -2546,7 +2563,7 @@ class MainWindow(QMainWindow):
                     res.update(output=r['path'], ok=True, n_saved=int(r['n_saved']), n_total=int(r['n_total']),
                                n_excluded=int(r['n_total']) - int(r['n_saved']))
                     print(f"[BATCH] {i + 1}/{n_jobs} {os.path.basename(src)} -> {r['path']}: "
-                          f"{r['n_saved']}/{r['n_total']} patterns ({res['n_excluded']} outside the IQ range), "
+                          f"{r['n_saved']}/{r['n_total']} patterns processed ({res['n_excluded']} outside the IQ range kept unprocessed), "
                           f"source {r['source_label']}, {time.time() - t0:.1f}s")
                 except BatchCancelled:
                     raise
@@ -2676,7 +2693,10 @@ class MainWindow(QMainWindow):
         cl.addWidget(g)
 
         # IQ Range
-        g = QGroupBox("IQ Range (excludes patterns outside range)"); gl = QVBoxLayout(g)
+        g = QGroupBox("IQ Range (patterns outside it are left unprocessed)"); gl = QVBoxLayout(g)
+        g.setToolTip("Patterns outside the IQ range take no part in the processing (background mean, global stretch,\n"
+                     "NLPAR sigma and neighbours) and are written to the output as they are, unprocessed,\n"
+                     "so that they stay in the data set and can still be indexed.")
         self.iq_min_lbl = QLabel("Min IQ: 0"); self.iq_max_lbl = QLabel("Max IQ: 100")
         self.iq_min_slider = QSlider(Qt.Horizontal); self.iq_min_slider.setRange(0, 1000); self.iq_min_slider.setValue(0)
         self.iq_max_slider = QSlider(Qt.Horizontal); self.iq_max_slider.setRange(0, 1000); self.iq_max_slider.setValue(1000)

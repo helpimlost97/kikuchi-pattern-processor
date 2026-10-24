@@ -180,6 +180,9 @@ saturation rule to its distances (the preview does).
 - 2026-10-13: Phase 3 done on the laptop (v1.6.0.dev3): IQ-range exclusion via zero-served
   patterns + sigma 0, saturation_protect / dthresh controls, upstream report drafted.
   Synthetic-scan checks pass on both engines. Legacy CuPy batch kept until the Phase 4 run. Still not run on real data; HPC cluster untouched.
+- 2026-10-24 (v1.7.0.dev2): the excluded patterns are no longer zeroed in the output. The NLPAR
+  batch puts the original patterns back at those positions (_restore_excluded_output) and
+  Apply && Save copies them through unprocessed, so they stay in the data set and can be indexed.
 - 2026-10-13: Phase 4, laptop part (v1.6.0.dev4): FG10 RKD 24-row subset run on all three
   engines; OpenCL kernel alignment/tail bugs found and fixed via patches/clnlpar_fixed.cl;
   OpenCL == numba (interior max 1); legacy == pyebsdindex with saturation protect off;

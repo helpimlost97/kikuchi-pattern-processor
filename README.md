@@ -34,7 +34,7 @@ turned out to be useful enough to publish.
   output (NLPAR temp files, `Apply && Save`) keeps the source extension
   because pyebsdindex and OIM take the bit depth from it.
 - Interactive **IQ map** with click-to-preview, Ctrl + scroll zoom, dual-slider
-  IQ range filtering, semi-transparent mask overlay for excluded patterns
+  IQ range, semi-transparent mask overlay for the patterns outside it
 - **NLPAR** using the canonical Brewick et al. 2019 formulation with
   dimensionless λ and a σ²-normalized weight: `w(i,j) = exp(-max(d̃, 0) / λ²)`
   - Full-dataset batch runs through **pyebsdindex's own NLPAR** (v1.6): its
@@ -50,7 +50,9 @@ turned out to be useful enough to publish.
     `opt_lambda` on one shared object, so σ is computed once per aperture
   - **IQ-range exclusion** carries into the batch: patterns outside the IQ range
     are neither averaged nor used as neighbours (served to pyebsdindex as flat
-    patterns with σ = 0, which gives them zero weight) and come out as zeros.
+    patterns with σ = 0, which gives them zero weight). They are not removed: the
+    output holds them as they were recorded, unprocessed, so the data set stays
+    complete and they can still be indexed (v1.7.0; earlier versions wrote zeros).
     Originally built for identifying carbides by TKD on extraction replicas,
     where most of the map is empty film and only the particles carry patterns
   - pyebsdindex's `saturation_protect` and `dthresh` are exposed in the panel
@@ -101,7 +103,8 @@ turned out to be useful enough to publish.
     so the next file starts from empty RAM. The IQ-range sliders apply per tile, as
     fractions of that tile's IQ range. A failed file is recorded (`ok: False`, `error`)
     and the batch goes on. The per-file results (`source, output, ok, error, n_saved,
-    n_total, seconds, n_excluded`) are returned and kept in `self.batch_results`.
+    n_total, seconds, n_excluded`) are returned and kept in `self.batch_results`;
+    `n_excluded` patterns were outside the IQ range and are in the output unprocessed.
     pyebsdindex's CPU NLPAR crashes on scans with fewer than 2·SR+1 rows, so the batch
     fails such a tile with an error instead (e.g. 3-row tiles need SR = 1).
 - **OIM-compatible UP1/UP2 output**: pyebsdindex's `write_data` only emits the
