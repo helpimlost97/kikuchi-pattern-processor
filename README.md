@@ -1,5 +1,11 @@
 # Kikuchi Pattern Processor (NPAR/NLPAR)
 
+> **Moved.** On 2026-10-24 this project became part of the Kikuchi workbench:
+> https://github.com/helpimlost97/gpu-accelerated-ebsd, folder `pattern_processor/`, with this
+> repository's full history. All further development happens there; this repository is archived
+> and no longer updated. The processor still runs on its own from that folder
+> (`python pattern_processor/gpu_pattern_viewer.py`).
+
 A GPU-accelerated GUI for viewing and processing EBSD / TKD / RKD Kikuchi pattern
 files (EDAX UP1/UP2 format). Provides on-demand and full-dataset NPAR and NLPAR
 denoising, plus the standard pattern-processing pipeline (static / dynamic
